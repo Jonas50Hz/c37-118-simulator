@@ -1,0 +1,31 @@
+[package]
+name = "c37-118-simulator"
+version = "0.1.0"
+edition = "2021"
+autobins = false
+license = "UNLICENSED"
+publish = false
+
+[lib]
+name = "c37_118_simulator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "c37-118-simulator"
+path = "src/main.rs"
+
+[[bin]]
+name = "c37-118-probe"
+path = "src/bin/c37-118-probe.rs"
+
+[dependencies]
+mio = { version = "1.0.3", features = ["net", "os-poll"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_yaml = "0.9.34"
+socket2 = "0.5.8"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
