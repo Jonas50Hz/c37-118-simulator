@@ -6,6 +6,7 @@
 use std::fmt;
 
 use crate::config::{EndpointDescriptor, PHASOR_COUNT, V2_PROTOCOL_VERSION};
+use crate::scenario::SignalExcursion;
 
 pub const SYNC_BYTE: u8 = 0xaa;
 pub const FRAME_HEADER_BYTES: usize = 14;
@@ -225,6 +226,26 @@ pub fn encode_periodic_data_into(
     timestamp: Timestamp,
     output: &mut [u8; PERIODIC_DATA_FRAME_BYTES],
 ) {
+    encode_periodic_data_with_scenario_into(
+        endpoint,
+        seed,
+        sample_index,
+        timestamp,
+        false,
+        None,
+        output,
+    );
+}
+
+pub fn encode_periodic_data_with_scenario_into(
+    endpoint: &EndpointDescriptor,
+    seed: u64,
+    sample_index: u64,
+    timestamp: Timestamp,
+    force_degraded_time: bool,
+    signal_excursion: Option<SignalExcursion>,
+    output: &mut [u8; PERIODIC_DATA_FRAME_BYTES],
+) {
     let metadata = endpoint
         .v2
         .as_ref()
@@ -236,7 +257,7 @@ pub fn encode_periodic_data_into(
         timestamp,
     );
     let mut offset = FRAME_HEADER_BYTES;
-    let stat = if metadata.good_stat {
+    let stat = if metadata.good_stat && !force_degraded_time {
         0
     } else {
         STAT_FLAG_SYNC_UNCERTAIN | STAT_PMU_TIME_QUALITY_UNKNOWN
@@ -248,8 +269,13 @@ pub fn encode_periodic_data_into(
     );
     for channel in 0..PHASOR_COUNT {
         let magnitude = if channel < 3 {
-            endpoint.voltage_magnitude
+            let magnitude = endpoint.voltage_magnitude
                 + endpoint.voltage_variation * waveform(seed, endpoint.index, channel, sample_index)
+            ;
+            match signal_excursion {
+                Some(signal) => magnitude + signal.voltage_magnitude_delta,
+                None => magnitude,
+            }
         } else {
             endpoint.current_magnitude
                 + endpoint.current_variation * waveform(seed, endpoint.index, channel, sample_index)
@@ -269,20 +295,36 @@ pub fn encode_periodic_data_into(
     write_i16(
         output,
         &mut offset,
-        fixed_frequency(
-            endpoint.frequency_deviation.nominal
-                + endpoint.frequency_deviation.variation
-                    * waveform(seed, endpoint.index, PHASOR_COUNT, sample_index),
-        ),
+        fixed_frequency(match signal_excursion {
+            Some(signal) => {
+                endpoint.frequency_deviation.nominal
+                    + endpoint.frequency_deviation.variation
+                        * waveform(seed, endpoint.index, PHASOR_COUNT, sample_index)
+                    + signal.frequency_deviation_hz
+            }
+            None => {
+                endpoint.frequency_deviation.nominal
+                    + endpoint.frequency_deviation.variation
+                        * waveform(seed, endpoint.index, PHASOR_COUNT, sample_index)
+            }
+        }),
     );
     write_i16(
         output,
         &mut offset,
-        fixed_rocof(
-            endpoint.rocof.nominal
-                + endpoint.rocof.variation
-                    * waveform(seed, endpoint.index, PHASOR_COUNT + 1, sample_index),
-        ),
+        fixed_rocof(match signal_excursion {
+            Some(signal) => {
+                endpoint.rocof.nominal
+                    + endpoint.rocof.variation
+                        * waveform(seed, endpoint.index, PHASOR_COUNT + 1, sample_index)
+                    + signal.rocof_hz_per_s
+            }
+            None => {
+                endpoint.rocof.nominal
+                    + endpoint.rocof.variation
+                        * waveform(seed, endpoint.index, PHASOR_COUNT + 1, sample_index)
+            }
+        }),
     );
     debug_assert_eq!(offset + FRAME_CHECKSUM_BYTES, PERIODIC_DATA_FRAME_BYTES);
     let checksum = crc16_ccitt(&output[..offset]);
@@ -418,11 +460,13 @@ fn write_i16(buffer: &mut [u8], offset: &mut usize, value: i16) {
 #[cfg(test)]
 mod tests {
     use crate::config::{load_profile, parse_profile};
+    use crate::scenario::SignalExcursion;
 
     use super::{
         checksum_matches, crc16_ccitt, encode_command, encode_configuration_1,
-        encode_configuration_2, encode_header, encode_periodic_data_into, parse_command, Command,
-        CommandRequest, FrameError, FrameView, Timestamp, FRAME_TYPE_COMMAND,
+        encode_configuration_2, encode_header, encode_periodic_data_into,
+        encode_periodic_data_with_scenario_into, parse_command, Command, CommandRequest,
+        FrameError, FrameView, Timestamp, FRAME_TYPE_COMMAND,
         FRAME_TYPE_CONFIGURATION_1, FRAME_TYPE_CONFIGURATION_2, FRAME_TYPE_HEADER,
         FRAME_TYPE_PERIODIC_DATA, PERIODIC_DATA_FRAME_BYTES, STAT_FLAG_SYNC_UNCERTAIN,
         STAT_PMU_TIME_QUALITY_UNKNOWN,
@@ -430,7 +474,7 @@ mod tests {
 
     fn endpoint() -> crate::config::EndpointDescriptor {
         parse_profile(
-            "seed: 7\nlimits:\n  max_logical_pmus: 1\n  max_clients_per_endpoint: 1\n  max_command_frame_bytes: 4096\n  requested_socket_receive_buffer_bytes: 4096\n  requested_socket_send_buffer_bytes: 4096\nfleet:\n  count: 1\n  bind_address: 127.0.0.1\n  first_listen_port: 4712\n  first_stream_id: 1001\n  first_pmu_id: 1001\n  pdc_name: WAMA\n  pmu_name_prefix: WAMA-PMU-\n  protocol_version: 2\n  data_rate_hz: 50\n  time_base: 1000000\n  nominal_frequency_hz: 50\n  phasors:\n    voltage_magnitude: 230000.0\n    voltage_variation: 400.0\n    voltage_class: 400000.0\n    voltage_scale: 10.0\n    current_magnitude: 500.0\n    current_variation: 1.5\n    current_scale: 1.0\n  frequency_deviation_hz:\n    nominal: 0.01\n    variation: 0.002\n  rocof_hz_per_s:\n    nominal: 0.0\n    variation: 0.001\n",
+            "seed: 7\nlimits:\n  max_logical_pmus: 1\n  max_clients_per_endpoint: 2\n  max_command_frame_bytes: 4096\n  requested_socket_receive_buffer_bytes: 4096\n  requested_socket_send_buffer_bytes: 4096\nfleet:\n  count: 1\n  bind_address: 127.0.0.1\n  first_listen_port: 4712\n  first_stream_id: 1001\n  first_pmu_id: 1001\n  pdc_name: WAMA\n  pmu_name_prefix: WAMA-PMU-\n  protocol_version: 2\n  data_rate_hz: 50\n  time_base: 1000000\n  nominal_frequency_hz: 50\n  phasors:\n    voltage_magnitude: 230000.0\n    voltage_variation: 400.0\n    voltage_class: 400000.0\n    voltage_scale: 10.0\n    current_magnitude: 500.0\n    current_variation: 1.5\n    current_scale: 1.0\n  frequency_deviation_hz:\n    nominal: 0.01\n    variation: 0.002\n  rocof_hz_per_s:\n    nominal: 0.0\n    variation: 0.001\n",
         )
         .expect("profile must compile")
         .endpoints
@@ -521,10 +565,21 @@ mod tests {
         };
         let mut first = [0_u8; PERIODIC_DATA_FRAME_BYTES];
         let mut second = [0_u8; PERIODIC_DATA_FRAME_BYTES];
+        let mut explicit_baseline = [0_u8; PERIODIC_DATA_FRAME_BYTES];
         encode_periodic_data_into(&endpoint, 7, 2, timestamp, &mut first);
         encode_periodic_data_into(&endpoint, 7, 2, timestamp, &mut second);
+        encode_periodic_data_with_scenario_into(
+            &endpoint,
+            7,
+            2,
+            timestamp,
+            false,
+            None,
+            &mut explicit_baseline,
+        );
 
         assert_eq!(first, second);
+        assert_eq!(first, explicit_baseline);
         assert!(checksum_matches(&first));
         let view = FrameView::parse(&first).expect("data must parse");
         assert_eq!(view.bytes()[1], 0x02);
@@ -535,6 +590,82 @@ mod tests {
             u16::from_be_bytes([view.body()[0], view.body()[1]]),
             STAT_FLAG_SYNC_UNCERTAIN | STAT_PMU_TIME_QUALITY_UNKNOWN,
         );
+    }
+
+    #[test]
+    fn forces_degraded_stat_for_a_good_stat_v2_pmu() {
+        let profile = load_profile(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/profiles/five-pmu-v2.yaml"
+        ))
+        .expect("five-PMU V2 profile must compile");
+        let endpoint = &profile.endpoints[0];
+        let timestamp = Timestamp {
+            soc: 1_700_000_000,
+            fracsec: 20_000,
+        };
+        let mut baseline = [0_u8; PERIODIC_DATA_FRAME_BYTES];
+        let mut degraded = [0_u8; PERIODIC_DATA_FRAME_BYTES];
+
+        encode_periodic_data_into(endpoint, profile.seed, 2, timestamp, &mut baseline);
+        encode_periodic_data_with_scenario_into(
+            endpoint,
+            profile.seed,
+            2,
+            timestamp,
+            true,
+            None,
+            &mut degraded,
+        );
+
+        assert_eq!(
+            u16::from_be_bytes([baseline[14], baseline[15]]),
+            0,
+        );
+        assert_eq!(
+            u16::from_be_bytes([degraded[14], degraded[15]]),
+            STAT_FLAG_SYNC_UNCERTAIN | STAT_PMU_TIME_QUALITY_UNKNOWN,
+        );
+        assert_eq!(baseline.len(), PERIODIC_DATA_FRAME_BYTES);
+        assert_eq!(degraded.len(), PERIODIC_DATA_FRAME_BYTES);
+        assert!(checksum_matches(&baseline));
+        assert!(checksum_matches(&degraded));
+        FrameView::parse(&degraded).expect("degraded data must parse");
+    }
+
+    #[test]
+    fn applies_v2_signal_excursion_without_changing_current_channels() {
+        let endpoint = endpoint();
+        let timestamp = Timestamp {
+            soc: 1_700_000_000,
+            fracsec: 20_000,
+        };
+        let mut baseline = [0_u8; PERIODIC_DATA_FRAME_BYTES];
+        let mut excursion = [0_u8; PERIODIC_DATA_FRAME_BYTES];
+
+        encode_periodic_data_into(&endpoint, 7, 2, timestamp, &mut baseline);
+        encode_periodic_data_with_scenario_into(
+            &endpoint,
+            7,
+            2,
+            timestamp,
+            false,
+            Some(SignalExcursion {
+                voltage_magnitude_delta: 100.0,
+                frequency_deviation_hz: 1.0,
+                rocof_hz_per_s: 1.0,
+            }),
+            &mut excursion,
+        );
+
+        assert_ne!(&baseline[16..28], &excursion[16..28]);
+        assert_eq!(&baseline[28..40], &excursion[28..40]);
+        assert_ne!(&baseline[40..44], &excursion[40..44]);
+        assert_eq!(baseline.len(), PERIODIC_DATA_FRAME_BYTES);
+        assert_eq!(excursion.len(), PERIODIC_DATA_FRAME_BYTES);
+        assert!(checksum_matches(&baseline));
+        assert!(checksum_matches(&excursion));
+        FrameView::parse(&excursion).expect("excursion data must parse");
     }
 
     #[test]

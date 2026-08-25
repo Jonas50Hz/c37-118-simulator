@@ -19,9 +19,12 @@ name = "c37-118-probe"
 path = "src/bin/c37-118-probe.rs"
 
 [dependencies]
+httparse = "1.9.5"
 mio = { version = "1.0.3", features = ["net", "os-poll"] }
 serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
 serde_yaml = "0.9.34"
+sha2 = "0.10.9"
 socket2 = "0.5.8"
 
 [lints.rust]

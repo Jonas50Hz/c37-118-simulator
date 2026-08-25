@@ -19,6 +19,11 @@ wire_version="${C37_118_WIRE_VERSION:-3}"
 profile_name="one-hundred-pmu.yaml"
 if [[ "$pmu_count" == "25" ]]; then
   profile_name="twenty-five-pmu.yaml"
+elif [[ "$pmu_count" == "150" ]]; then
+  profile_name="one-hundred-fifty-pmu.yaml"
+elif [[ "$pmu_count" != "100" ]]; then
+  printf '%s\n' "manual scale test PMU count must be 25, 100, or 150" >&2
+  exit 2
 fi
 if [[ "$wire_version" == "2" ]]; then
   profile_name="${profile_name%.yaml}-v2.yaml"
@@ -33,6 +38,7 @@ network_name="wama-c37-118-scale-$pmu_count-$$"
 container_name="wama-c37-118-simulator-$pmu_count-$$"
 lock_directory="${TMPDIR:-/tmp}/wama-c37-118-scale.lock"
 metrics_file=""
+time_sync_status_file=""
 simulator_id=""
 monitor_pid=""
 profile_sha256=""
@@ -65,6 +71,7 @@ cleanup() {
   fi
   docker network rm "$network_name" >/dev/null 2>&1 || true
   [[ -n "$metrics_file" ]] && rm -f "$metrics_file"
+  [[ -n "$time_sync_status_file" ]] && rm -f "$time_sync_status_file"
   rmdir "$lock_directory" 2>/dev/null || true
   exit "$exit_code"
 }
@@ -127,6 +134,8 @@ if [[ ! -f "$profile_path" ]]; then
 fi
 
 metrics_file="$(mktemp)"
+time_sync_status_file="$(mktemp)"
+printf '%s\n' verified > "$time_sync_status_file"
 profile_sha256="$(sha256sum "$profile_path" | awk '{ print $1 }')"
 docker build --tag "$image_name" --file "$service_directory/Dockerfile" "$repository_root"
 image_id="$(docker image inspect --format '{{.Id}}' "$image_name")"
@@ -140,7 +149,13 @@ simulator_id="$(docker run --detach --rm --name "$container_name" \
   --pids-limit 256 \
   --read-only \
   --volume "$profile_path:/etc/c37-118/profile.yaml:ro" \
-  "$image_name" run --profile /etc/c37-118/profile.yaml)"
+  --volume "$time_sync_status_file:/etc/c37-118/time-sync-status:ro" \
+  "$image_name" run \
+    --profile /etc/c37-118/profile.yaml \
+    --scenario-catalog /etc/c37-118/scenarios/baseline.yaml \
+    --deployment-label manual-scale \
+    --management-bind 0.0.0.0:8080 \
+    --time-sync-status-file /etc/c37-118/time-sync-status)"
 
 for _ in $(seq 1 30); do
   if docker logs "$simulator_id" 2>&1 | grep -q "starting C37.118 simulator"; then

@@ -9,18 +9,37 @@ services:
       - run
       - --profile
       - /etc/c37-118/profile.yaml
+      - --scenario-catalog
+      - /etc/c37-118/scenario-catalog.yaml
+      - --deployment-label
+      - ${C37_118_DEPLOYMENT_LABEL:-wama-lab}
+      - --management-bind
+      - ${C37_118_MANAGEMENT_BIND:-0.0.0.0:8080}
+      - --time-sync-status-file
+      - /run/c37-118/time-sync-status
+    environment:
+      C37_118_IMAGE_REF: ${C37_118_IMAGE_REF:-local-build}
     volumes:
       - type: bind
         source: ${C37_118_SIMULATOR_PROFILE_SOURCE:-./profiles/five-pmu-v2.yaml}
         target: /etc/c37-118/profile.yaml
         read_only: true
+      - type: bind
+        source: ${C37_118_SIMULATOR_SCENARIO_CATALOG_SOURCE:-./scenarios/baseline.yaml}
+        target: /etc/c37-118/scenario-catalog.yaml
+        read_only: true
+      - type: bind
+        source: ${C37_118_TIME_SYNC_STATUS_SOURCE:-./runtime/time-sync-status}
+        target: /run/c37-118/time-sync-status
+        read_only: true
     expose:
-      - "4712-4811"
+      - "4712-4861"
+      - "8080"
     networks:
       wama-infra:
         ipv4_address: 172.30.0.10
     healthcheck:
-      test: ["CMD", "c37-118-simulator", "healthcheck"]
+      test: ["CMD", "c37-118-simulator", "healthcheck", "--management-address", "127.0.0.1:8080"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -28,7 +47,7 @@ services:
     mem_limit: 64m
     pids_limit: 256
     read_only: true
-    restart: "no"
+    restart: unless-stopped
 
 networks:
   wama-infra:

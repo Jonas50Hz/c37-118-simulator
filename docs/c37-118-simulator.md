@@ -25,6 +25,12 @@ Each profile explicitly selects C37.118.2-2011 V2 or C37.118.2-2024 V3 through
 frames for its selected version. It does not negotiate versions, accept V1, or
 bridge V2/V3 traffic.
 
+Each endpoint owns exactly two bounded PDC slots. A third PDC is rejected. A
+new PDC has 15 seconds to send a valid command, a non-streaming PDC expires
+after five minutes, and a slow PDC is disconnected without interrupting its
+peer. The process uses Compose `restart: unless-stopped`; it is not a
+high-availability PMU.
+
 ## Wire subsets
 
 All fields are encoded in network byte order and use CRC-CCITT with seed
@@ -117,8 +123,9 @@ raw-frame retention are excluded.
 ## Fixed PMU profile
 
 One listener models one independently addressable PMU. The simulator has a hard
-maximum of 100 listeners in one single-threaded Rust event loop. The full fleet uses
-ports `4712` through `4811` and stream/PMU identifiers `1001` through `1100`.
+maximum of 150 listeners in one single-threaded Rust event loop. The full fleet
+uses ports `4712` through `4861` and stream/PMU identifiers `1001` through
+`1150`.
 No service port is mapped to the host by default.
 
 Each V3 configuration frame has one PMU and declares:
@@ -146,13 +153,13 @@ The shipping YAML shape is:
 ```yaml
 seed: 20260821
 limits:
-  max_logical_pmus: 100
-  max_clients_per_endpoint: 1
+  max_logical_pmus: 150
+  max_clients_per_endpoint: 2
   max_command_frame_bytes: 4096
   requested_socket_receive_buffer_bytes: 4096
   requested_socket_send_buffer_bytes: 4096
 fleet:
-  count: 100
+  count: 150
   bind_address: 0.0.0.0
   first_listen_port: 4712
   first_stream_id: 1001
@@ -181,7 +188,8 @@ fleet:
 
 Use `protocol_version: 2` for V2. The supplied profiles are
 `one-pmu-v2.yaml`, `five-pmu-v2.yaml`, `ten-pmu-v2.yaml`, `twenty-five-pmu-v2.yaml`, and
-`one-hundred-pmu-v2.yaml`; the existing names without `-v2` remain V3.
+`one-hundred-pmu-v2.yaml`, plus `one-hundred-fifty-pmu-v2.yaml`; the existing
+names without `-v2` remain V3.
 
 The default Forgejo onboarding demonstration profile is `five-pmu-v2.yaml`.
 This repository's Compose project assigns the manually started simulator its
@@ -207,6 +215,63 @@ and sample index. The service retains no sample history or random-event queue.
 Its UTC measurement timestamps start at the next valid frame boundary and
 advance in exact `TIME_BASE / data_rate_hz` steps.
 
+## Management Plane
+
+The Management Plane is one HTTP/1.1 listener on port `8080` of the private
+routed network. It is not a per-PMU protocol port and does not publish a host
+mapping by default. It uses the IT-managed trusted network boundary; it has no
+TLS or application authentication.
+
+The listener accepts one bounded request per connection and closes the
+connection after its response. It rejects transfer encoding, ambiguous content
+length, HTTP/1.1 requests without exactly one valid `Host` header, unknown JSON
+fields, and request bodies larger than 8 KiB. Responses have a 64 KiB body
+limit. Errors use this JSON envelope:
+
+```json
+{"error":{"code":"machine_readable_code","message":"human-readable message"}}
+```
+
+| Method and path | Response | Description |
+| --- | --- | --- |
+| `GET /healthz` | `200` JSON | Process liveness. |
+| `GET /readyz` | `200` or `503` JSON | All C37.118 and Management Plane listeners are bound and the selected wire version has passed the local frame self-check. PDC connections and Time Health do not determine readiness. |
+| `GET /metrics` | `200` text | Prometheus-compatible process, readiness, Time Health, PDC, scenario, and low-cardinality per-stream metrics. |
+| `GET /v1/state` | `200` JSON | Runtime identity, Time Health, counters, PDC connection IDs, and scenario-controller state. |
+| `POST /v1/scenarios/prepare` | `202` JSON | Prepares a named Fault Scenario for an endpoint or PDC target. |
+| `POST /v1/scenarios/confirm` | `202` JSON | Consumes a 60-second preparation token and queues the action for the next reporting boundary. |
+| `POST /v1/scenarios/clear` | `202` JSON | Prepares a confirmed clear for an active sustained scenario. |
+
+`POST /v1/scenarios/prepare` accepts the following shape. Omit
+`connection_id` for an endpoint target. `disconnect-pdc` requires a PDC target;
+the other shipped scenarios require an endpoint target.
+
+```json
+{
+  "target":{"stream_id":1001,"connection_id":42},
+  "scenario_name":"disconnect-pdc",
+  "actor_label":"operator-label"
+}
+```
+
+`POST /v1/scenarios/confirm` accepts `{"token":42}`. The optional
+`actor_label` fields are recorded as unverified attribution in JSON logs; they
+are not authentication. One target can have only one prepared, pending, or
+active scenario. A transient scenario clears itself after its frame-relative
+duration. A sustained scenario requires the same prepare/confirm flow to clear.
+
+Startup logs, `/readyz`, `/v1/state`, and `c37_118_simulator_runtime_info`
+identify the deployment label, image reference, profile SHA-256, and scenario
+catalog SHA-256. Scenario-control actions are emitted as JSON log records.
+
+The Compose time-status mount defaults to `runtime/time-sync-status`. A file
+whose trimmed ASCII contents are exactly `verified` reports verified Time
+Health. Any other value or an unreadable file produces conservative degraded
+time quality without making `/readyz` fail. A host-clock regression greater
+than one reporting interval also degrades Time Health. The scheduler retains
+monotonic C37.118 timestamps and recovers Time Health automatically at a later
+verified reporting boundary.
+
 ## Memory and backpressure
 
 The application-memory shape is bounded:
@@ -217,10 +282,10 @@ base process + compiled endpoint descriptors + one data buffer per endpoint
 ```
 
 Each connection has a maximum 4 KiB command buffer. Each endpoint has one
-current periodic-data buffer and no application-level transmit history. A client
-that cannot drain its pending frame by the next reporting tick is closed rather
-than causing an unbounded backlog. The simulator has no worker per PMU, client,
-or sample.
+current periodic-data buffer, two PDC slots, and no application-level transmit
+history. A client that cannot drain its pending frame by the next reporting tick
+is closed rather than causing an unbounded backlog. The simulator has no worker
+per PMU, client, or sample.
 
 ## Verification
 
@@ -242,23 +307,32 @@ The normal smoke stages are one PMU and ten PMUs for each wire version. The
 ten-PMU stage retains 50 Hz per endpoint and validates every connection with the
 standalone probe.
 
-The 25-PMU five-minute and 100-PMU 15-minute tests are manually armed only:
+The release baseline is manually armed with `C37_118_RUN_BASELINE=1
+scripts/test-baseline.sh`. It validates V2 and V3 separately with 10 PMUs, two
+PDCs per PMU, and 50 Hz. Each version runs a fixed five-minute active phase and
+a fixed 15-minute idle phase. The active phase requires zero skipped ticks,
+proves a selected PDC disconnect leaves its peer at 50 Hz, and retains a JSON
+artifact with profile/catalog hashes, image identity, resource observations,
+state snapshots, and probe outcomes.
+
+The 25-PMU, 100-PMU, and 150-PMU benchmarks are manually armed only:
 
 ```sh
 C37_118_RUN_25_PMU=1 scripts/test-25-pmu.sh
 C37_118_RUN_100_PMU=1 scripts/test-100-pmu.sh
 C37_118_RUN_100_PMU=1 scripts/test-100-pmu-idle.sh
+C37_118_RUN_150_PMU=1 scripts/test-150-pmu.sh
 ```
 
-Set `C37_118_WIRE_VERSION=2` only when deliberately running one of these
-already-armed manual V2 soaks. The default is V3. Neither V2 large-fleet test is
-part of default startup, lifecycle validation, or CI.
+Set `C37_118_WIRE_VERSION=2` only when deliberately running a 25-PMU or
+100-PMU V2 benchmark. The 150-PMU benchmark is best-effort and does not block
+the release baseline.
 
 They use a labeled private Docker network rather than `wama-infra`, enforce a
 single-run lock, require cgroup memory accounting, cap simulator memory, and
-remove only their labeled resources. The active 100-PMU test requires 100
-clients at 50 Hz for 15 minutes; the idle test separately checks listener-only
-memory. Neither test is part of default startup, lifecycle validation, or CI.
+remove only their labeled resources. The 100-PMU and 150-PMU runs remain
+best-effort informational benchmarks and do not block the 10-PMU release gate.
 
-An approved external V2 or V3 capture or decoder is still required before making
-an interoperability or conformance claim.
+Use [the physical-PDC certification guide](how-to/certify-physical-pdc.md) when
+an approved PDC is available. Built-in probes are implementation validation;
+they are not independent interoperability evidence.

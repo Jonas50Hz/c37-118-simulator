@@ -1,0 +1,35 @@
+version: 1
+scenarios:
+  - name: normal
+    kind: normal
+    start_frame_offset: 0
+    lifecycle: sustained
+  - name: degraded-time
+    kind: degraded_time
+    start_frame_offset: 0
+    lifecycle: transient
+    duration_frames: 50
+  - name: missing-frames
+    kind: missing_frames
+    start_frame_offset: 0
+    lifecycle: transient
+    duration_frames: 50
+  - name: disconnect-pdc
+    kind: disconnect_pdc
+    start_frame_offset: 0
+    lifecycle: transient
+    duration_frames: 1
+  - name: signal-excursion
+    kind: signal_excursion
+    start_frame_offset: 0
+    lifecycle: transient
+    duration_frames: 50
+    signal:
+      voltage_magnitude_delta: 2300.0
+      frequency_deviation_hz: 0.5
+      rocof_hz_per_s: 1.0
+  - name: recovery
+    kind: recovery
+    start_frame_offset: 0
+    lifecycle: transient
+    duration_frames: 1

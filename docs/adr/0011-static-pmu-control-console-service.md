@@ -1,0 +1,3 @@
+# Use A Static PMU Control Console Service
+
+The PMU Control Console runs as a separate static browser service in the Compose project, served by Caddy rather than adopting a client-side framework. Caddy proxies same-origin `/api` requests to Management Plane endpoints and starts independently of simulator readiness, so the browser can show Console Stale State during an outage. The console retains no simulator authority, which keeps the browser surface deployable without a frontend build runtime.

@@ -1,0 +1,3 @@
+# Bound the Management Plane to Scenario Control
+
+The emulator exposes one shared HTTP Management Plane on the trusted private routed network. It supports read-only operational state and confirmed runtime Fault Scenario activation at reporting boundaries, while PMU identity, wire configuration, and capacity remain startup-profile decisions; this keeps live control deterministic without introducing dynamic configuration semantics.

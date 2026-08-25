@@ -8,7 +8,7 @@ use std::{
 
 use serde::Deserialize;
 
-pub const MAX_LOGICAL_PMUS: usize = 100;
+pub const MAX_LOGICAL_PMUS: usize = 150;
 pub const PHASOR_COUNT: usize = 6;
 pub const FREQUENCY_COUNT: usize = 1;
 pub const ROCOF_COUNT: usize = 1;
@@ -320,9 +320,9 @@ fn validate_limits(limits: &RawLimits) -> Result<(), ConfigError> {
             "limits.max_logical_pmus must be in 1..={MAX_LOGICAL_PMUS}"
         )));
     }
-    if limits.max_clients_per_endpoint != 1 {
+    if limits.max_clients_per_endpoint != 2 {
         return Err(ConfigError::new(
-            "limits.max_clients_per_endpoint must be exactly 1 in V1",
+            "limits.max_clients_per_endpoint must be exactly 2",
         ));
     }
     if !(18..=MAX_COMMAND_FRAME_BYTES).contains(&limits.max_command_frame_bytes) {
@@ -623,19 +623,26 @@ mod tests {
 
     fn profile(count: usize) -> String {
         format!(
-            "seed: 7\nlimits:\n  max_logical_pmus: 100\n  max_clients_per_endpoint: 1\n  max_command_frame_bytes: 4096\n  requested_socket_receive_buffer_bytes: 4096\n  requested_socket_send_buffer_bytes: 4096\nfleet:\n  count: {count}\n  bind_address: 127.0.0.1\n  first_listen_port: 4712\n  first_stream_id: 1001\n  first_pmu_id: 1001\n  pdc_name: WAMA\n  pmu_name_prefix: WAMA-PMU-\n  protocol_version: 3\n  data_rate_hz: 50\n  time_base: 1000000\n  nominal_frequency_hz: 50\n  phasors:\n    voltage_magnitude: 230000.0\n    voltage_variation: 400.0\n    voltage_class: 400000.0\n    voltage_scale: 10.0\n    current_magnitude: 500.0\n    current_variation: 1.5\n    current_scale: 1.0\n  frequency_deviation_hz:\n    nominal: 0.01\n    variation: 0.002\n  rocof_hz_per_s:\n    nominal: 0.0\n    variation: 0.001\n"
+            "seed: 7\nlimits:\n  max_logical_pmus: {MAX_LOGICAL_PMUS}\n  max_clients_per_endpoint: 2\n  max_command_frame_bytes: 4096\n  requested_socket_receive_buffer_bytes: 4096\n  requested_socket_send_buffer_bytes: 4096\nfleet:\n  count: {count}\n  bind_address: 127.0.0.1\n  first_listen_port: 4712\n  first_stream_id: 1001\n  first_pmu_id: 1001\n  pdc_name: WAMA\n  pmu_name_prefix: WAMA-PMU-\n  protocol_version: 3\n  data_rate_hz: 50\n  time_base: 1000000\n  nominal_frequency_hz: 50\n  phasors:\n    voltage_magnitude: 230000.0\n    voltage_variation: 400.0\n    voltage_class: 400000.0\n    voltage_scale: 10.0\n    current_magnitude: 500.0\n    current_variation: 1.5\n    current_scale: 1.0\n  frequency_deviation_hz:\n    nominal: 0.01\n    variation: 0.002\n  rocof_hz_per_s:\n    nominal: 0.0\n    variation: 0.001\n"
         )
     }
 
     #[test]
-    fn expands_a_100_pmu_fleet_without_retaining_yaml_nodes() {
+    fn expands_the_maximum_fleet_without_retaining_yaml_nodes() {
         let compiled = parse_profile(&profile(MAX_LOGICAL_PMUS)).expect("profile must compile");
+        let last_index = MAX_LOGICAL_PMUS - 1;
 
         assert_eq!(compiled.endpoints.len(), MAX_LOGICAL_PMUS);
         assert_eq!(compiled.endpoints[0].address.port(), 4712);
-        assert_eq!(compiled.endpoints[99].address.port(), 4811);
+        assert_eq!(
+            compiled.endpoints[last_index].address.port(),
+            4712 + last_index as u16
+        );
         assert_eq!(compiled.endpoints[0].stream_id, 1001);
-        assert_eq!(compiled.endpoints[99].stream_id, 1100);
+        assert_eq!(
+            compiled.endpoints[last_index].stream_id,
+            1001 + last_index as u16
+        );
         assert_eq!(compiled.endpoints[0].pmu_id, 1001);
         assert_eq!(compiled.endpoints[0].pmu_name, b"\x0cWAMA-PMU-001");
         assert_eq!(compiled.endpoints[0].global_pmu_id[6] >> 4, 4);
@@ -703,6 +710,28 @@ mod tests {
             .map(|endpoint| endpoint.v2.as_ref().expect("V2 metadata must be present").good_stat)
             .collect();
         assert_eq!(good_stats, vec![true, true, false, false, false]);
+    }
+
+    #[test]
+    fn loads_the_shipped_one_hundred_fifty_pmu_profiles() {
+        for (profile_path, expected_wire_version) in [
+            ("/profiles/one-hundred-fifty-pmu.yaml", WireVersion::V3),
+            ("/profiles/one-hundred-fifty-pmu-v2.yaml", WireVersion::V2),
+        ] {
+            let compiled = load_profile(format!("{}{}", env!("CARGO_MANIFEST_DIR"), profile_path))
+                .expect("150-PMU profile must compile");
+
+            assert_eq!(compiled.endpoints.len(), 150);
+            assert_eq!(compiled.endpoints[0].address.port(), 4712);
+            assert_eq!(compiled.endpoints[149].address.port(), 4861);
+            assert_eq!(compiled.endpoints[149].stream_id, 1150);
+            assert!(
+                compiled
+                    .endpoints
+                    .iter()
+                    .all(|endpoint| endpoint.wire_version == expected_wire_version)
+            );
+        }
     }
 
     #[test]

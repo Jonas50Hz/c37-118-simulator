@@ -29,9 +29,10 @@ const FRAME_CHECKSUM_BYTES: usize = 2;
 fn main() {
     match run() {
         Ok(summary) => println!(
-            "probe_result endpoints={} data_frames={} elapsed_ms={}",
+            "probe_result endpoints={} data_frames={} minimum_endpoint_data_frames={} elapsed_ms={}",
             summary.endpoints,
             summary.data_frames,
+            summary.minimum_endpoint_data_frames,
             summary.elapsed.as_millis()
         ),
         Err(error) => {
@@ -182,7 +183,12 @@ enum ClientState {
 pub(crate) struct ProbeSummary {
     pub(crate) endpoints: usize,
     pub(crate) data_frames: u64,
+    pub(crate) minimum_endpoint_data_frames: u64,
     pub(crate) elapsed: Duration,
+}
+
+pub(crate) fn minimum_endpoint_data_frames(data_frames: impl Iterator<Item = u64>) -> u64 {
+    data_frames.min().unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +283,9 @@ impl Probe {
         Ok(ProbeSummary {
             endpoints: self.clients.len(),
             data_frames: self.clients.iter().map(|client| client.data_frames).sum(),
+            minimum_endpoint_data_frames: minimum_endpoint_data_frames(
+                self.clients.iter().map(|client| client.data_frames),
+            ),
             elapsed: started.elapsed(),
         })
     }
@@ -742,7 +751,19 @@ fn usage() -> ProbeError {
 mod tests {
     use c37_118_simulator::wire_v3::{encode_command, Command, Timestamp};
 
-    use super::{decode_v3_frame, validate_frame_identity};
+    use super::{
+        decode_v3_frame, minimum_endpoint_data_frames, validate_frame_identity,
+    };
+
+    #[test]
+    fn finds_the_lowest_endpoint_data_frame_count() {
+        assert_eq!(minimum_endpoint_data_frames([52, 50, 51].into_iter()), 50);
+    }
+
+    #[test]
+    fn reports_zero_minimum_without_endpoints() {
+        assert_eq!(minimum_endpoint_data_frames(std::iter::empty()), 0);
+    }
 
     #[test]
     fn rejects_a_frame_for_another_endpoint() {

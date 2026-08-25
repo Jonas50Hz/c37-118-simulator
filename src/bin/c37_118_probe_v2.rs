@@ -12,7 +12,7 @@ use c37_118_simulator::wire_v2::{
 };
 use mio::{net::TcpStream, Events, Interest, Poll, Token};
 
-use super::{ProbeArguments, ProbeError, ProbeSummary};
+use super::{minimum_endpoint_data_frames, ProbeArguments, ProbeError, ProbeSummary};
 
 const MAX_FRAME_BYTES: usize = 4 * 1024;
 const EVENTS_CAPACITY: usize = 256;
@@ -157,6 +157,9 @@ impl Probe {
         Ok(ProbeSummary {
             endpoints: self.clients.len(),
             data_frames: self.clients.iter().map(|client| client.data_frames).sum(),
+            minimum_endpoint_data_frames: minimum_endpoint_data_frames(
+                self.clients.iter().map(|client| client.data_frames),
+            ),
             elapsed: started.elapsed(),
         })
     }
