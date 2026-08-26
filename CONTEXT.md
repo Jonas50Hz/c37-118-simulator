@@ -72,6 +72,10 @@ _Avoid_: restart-only scenario activation, public management API
 A two-step prepare and confirm operation, using a 60-second activation token, that makes Runtime Scenario Control intentional and auditable.
 _Avoid_: one-step live activation
 
+**Preparation Cancellation**:
+An explicit operation that releases a prepared but unconfirmed Fault Scenario action.
+_Avoid_: cancelling an active Fault Scenario
+
 **Management Plane**:
 One shared HTTP endpoint on the Private Routed Network through which operators inspect emulator state and control Fault Scenarios. It does not alter PMU identity, wire configuration, or capacity while the emulator is running.
 _Avoid_: per-PMU management endpoint, live profile editor

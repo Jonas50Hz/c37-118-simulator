@@ -1,7 +1,7 @@
 //! Startup-validated, frame-relative fault-scenario catalogs.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt, fs,
     path::Path,
     time::{Duration, Instant},
@@ -9,7 +9,18 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::{config::MAX_LOGICAL_PMUS, identity::sha256_hex};
+
 pub const SCENARIO_CATALOG_VERSION: u32 = 1;
+/// Maximum immutable catalog entries accepted by the bounded management response.
+pub const MAX_SCENARIO_CATALOG_ENTRIES: usize = 128;
+/// Maximum distinct endpoint and PDC targets retained by the 150-PMU fleet read model.
+pub const MAX_SCENARIO_TARGETS: usize = MAX_LOGICAL_PMUS * 3;
+/// Maximum UTF-8 bytes retained verbatim for an operator attribution label.
+///
+/// This bound keeps a 48-record console page below the management response cap
+/// without changing the meaning of absent or empty labels.
+pub const MAX_SCENARIO_ACTOR_LABEL_BYTES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ScenarioCatalog {
@@ -24,6 +35,13 @@ impl ScenarioCatalog {
 
     pub fn scenario(&self, name: &str) -> Option<&ScenarioDefinition> {
         self.scenarios.iter().find(|scenario| scenario.name == name)
+    }
+
+    /// Returns a stable SHA-256 identity of the compiled catalog content.
+    pub fn content_sha256(&self) -> String {
+        let contents = serde_json::to_vec(self)
+            .expect("compiled scenario catalogs must serialize as JSON");
+        sha256_hex(&contents)
     }
 }
 
@@ -82,8 +100,7 @@ impl ScenarioTarget {
 }
 
 /// An opaque token returned by prepare and consumed by confirm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ActivationToken(u64);
 
 impl ActivationToken {
@@ -93,6 +110,15 @@ impl ActivationToken {
 
     pub fn from_value(value: u64) -> Option<Self> {
         (value != 0).then_some(Self(value))
+    }
+}
+
+impl Serialize for ActivationToken {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(&self.0)
     }
 }
 
@@ -111,6 +137,7 @@ pub enum ScenarioAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PreparedScenarioSnapshot {
     pub token: ActivationToken,
+    pub confirm_expires_in_ms: u64,
     pub target: ScenarioTarget,
     pub action: ScenarioAction,
     pub actor_label: Option<String>,
@@ -167,12 +194,14 @@ impl FramePlan {
 pub enum ScenarioControllerError {
     InvalidTarget { target: ScenarioTarget },
     InvalidScenarioName { name: String },
+    InvalidActorLabel { maximum: usize },
     UnknownScenario { name: String },
     IncompatibleTarget {
         target: ScenarioTarget,
         kind: ScenarioKind,
     },
     TargetBusy { target: ScenarioTarget },
+    TargetCapacityExceeded { maximum: usize },
     NoActiveScenario { target: ScenarioTarget },
     ClearRequiresSustainedScenario { target: ScenarioTarget },
     UnknownToken { token: ActivationToken },
@@ -192,6 +221,10 @@ impl fmt::Display for ScenarioControllerError {
                 formatter,
                 "scenario name {name:?} must contain 1 to 64 lowercase ASCII letters, digits, or hyphens"
             ),
+            Self::InvalidActorLabel { maximum } => write!(
+                formatter,
+                "actor label must contain at most {maximum} UTF-8 bytes"
+            ),
             Self::UnknownScenario { name } => write!(formatter, "unknown scenario {name:?}"),
             Self::IncompatibleTarget { target, kind } => write!(
                 formatter,
@@ -200,6 +233,10 @@ impl fmt::Display for ScenarioControllerError {
             Self::TargetBusy { target } => {
                 write!(formatter, "scenario target already has an active or pending action: {target:?}")
             }
+            Self::TargetCapacityExceeded { maximum } => write!(
+                formatter,
+                "scenario controller cannot track more than {maximum} targets"
+            ),
             Self::NoActiveScenario { target } => {
                 write!(formatter, "scenario target has no active scenario to clear: {target:?}")
             }
@@ -276,6 +313,7 @@ pub struct ScenarioController {
     active: BTreeMap<ScenarioTarget, ActiveScenarioAction>,
     current_sample_index: Option<u64>,
     next_token: u64,
+    revision: u64,
 }
 
 impl ScenarioController {
@@ -288,11 +326,21 @@ impl ScenarioController {
             active: BTreeMap::new(),
             current_sample_index: None,
             next_token: 1,
+            revision: 0,
         }
     }
 
     pub fn catalog(&self) -> &ScenarioCatalog {
         &self.catalog
+    }
+
+    /// Monotonically increases whenever lifecycle records change.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn has_active_target(&self, target: ScenarioTarget) -> bool {
+        self.active.contains_key(&target)
     }
 
     /// Prepares activation of a catalog scenario without affecting frame plans.
@@ -306,6 +354,7 @@ impl ScenarioController {
         let scenario_name = scenario_name.as_ref();
         validate_controller_target(target)?;
         validate_controller_name(scenario_name)?;
+        validate_actor_label(actor_label.as_deref())?;
 
         let scenario = self
             .catalog
@@ -333,6 +382,7 @@ impl ScenarioController {
         now: Instant,
     ) -> Result<PreparedScenarioSnapshot, ScenarioControllerError> {
         validate_controller_target(target)?;
+        validate_actor_label(actor_label.as_deref())?;
         self.discard_expired_preparations(now);
 
         if self.prepared_targets.contains_key(&target) || self.pending.contains_key(&target) {
@@ -361,6 +411,7 @@ impl ScenarioController {
             .remove(&token)
             .ok_or(ScenarioControllerError::UnknownToken { token })?;
         self.prepared_targets.remove(&prepared.target);
+        self.bump_revision();
 
         if now >= prepared.expires_at {
             return Err(ScenarioControllerError::ExpiredToken { token });
@@ -403,6 +454,26 @@ impl ScenarioController {
         Ok(snapshot)
     }
 
+    /// Consumes a live prepared token without queueing an action.
+    pub fn cancel(
+        &mut self,
+        token: ActivationToken,
+        now: Instant,
+    ) -> Result<PreparedScenarioSnapshot, ScenarioControllerError> {
+        let prepared = self
+            .prepared
+            .remove(&token)
+            .ok_or(ScenarioControllerError::UnknownToken { token })?;
+        self.prepared_targets.remove(&prepared.target);
+        self.bump_revision();
+
+        if now >= prepared.expires_at {
+            return Err(ScenarioControllerError::ExpiredToken { token });
+        }
+        self.discard_expired_preparations(now);
+        Ok(prepared.snapshot(token, now))
+    }
+
     /// Applies queued actions at a reporting boundary and expires transients.
     pub fn advance_boundary(
         &mut self,
@@ -419,6 +490,7 @@ impl ScenarioController {
 
         self.current_sample_index = Some(sample_index);
         let pending = std::mem::take(&mut self.pending);
+        let changed_lifecycle_records = !pending.is_empty();
         for (target, action) in pending {
             match action.action {
                 StoredScenarioAction::Activate(scenario) => {
@@ -436,7 +508,11 @@ impl ScenarioController {
                 }
             }
         }
+        let active_count = self.active.len();
         self.expire_transient_actions(sample_index);
+        if changed_lifecycle_records || self.active.len() != active_count {
+            self.bump_revision();
+        }
         Ok(())
     }
 
@@ -481,21 +557,20 @@ impl ScenarioController {
         self.discard_expired_preparations(now);
         ScenarioControllerSnapshot {
             current_sample_index: self.current_sample_index,
-            prepared: self.prepared_actions(),
+            prepared: self.prepared_actions_at(now),
             pending: self.pending_actions(),
             active: self.active_scenarios(),
         }
     }
 
     pub fn prepared_actions(&self) -> Vec<PreparedScenarioSnapshot> {
+        self.prepared_actions_at(Instant::now())
+    }
+
+    fn prepared_actions_at(&self, now: Instant) -> Vec<PreparedScenarioSnapshot> {
         self.prepared
             .iter()
-            .map(|(token, prepared)| PreparedScenarioSnapshot {
-                token: *token,
-                target: prepared.target,
-                action: prepared.action.snapshot(),
-                actor_label: prepared.actor_label.clone(),
-            })
+            .map(|(token, prepared)| prepared.snapshot(*token, now))
             .collect()
     }
 
@@ -540,6 +615,11 @@ impl ScenarioController {
         {
             return Err(ScenarioControllerError::TargetBusy { target });
         }
+        if !self.tracks_target(target) && self.tracked_target_count() >= MAX_SCENARIO_TARGETS {
+            return Err(ScenarioControllerError::TargetCapacityExceeded {
+                maximum: MAX_SCENARIO_TARGETS,
+            });
+        }
 
         let expires_at = now
             .checked_add(ACTIVATION_TOKEN_TTL)
@@ -551,23 +631,33 @@ impl ScenarioController {
         let token = ActivationToken(self.next_token);
         self.next_token = next_token;
 
-        let snapshot = PreparedScenarioSnapshot {
-            token,
+        let prepared = PreparedScenarioAction {
             target,
-            action: action.snapshot(),
-            actor_label: actor_label.clone(),
+            action,
+            actor_label,
+            expires_at,
         };
-        self.prepared.insert(
-            token,
-            PreparedScenarioAction {
-                target,
-                action,
-                actor_label,
-                expires_at,
-            },
-        );
+        let snapshot = prepared.snapshot(token, now);
+        self.prepared.insert(token, prepared);
         self.prepared_targets.insert(target, token);
+        self.bump_revision();
         Ok(snapshot)
+    }
+
+    fn tracks_target(&self, target: ScenarioTarget) -> bool {
+        self.prepared_targets.contains_key(&target)
+            || self.pending.contains_key(&target)
+            || self.active.contains_key(&target)
+    }
+
+    fn tracked_target_count(&self) -> usize {
+        self.active
+            .keys()
+            .chain(self.pending.keys())
+            .chain(self.prepared_targets.keys())
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len()
     }
 
     fn discard_expired_preparations(&mut self, now: Instant) {
@@ -579,8 +669,16 @@ impl ScenarioController {
         for token in expired_tokens {
             if let Some(prepared) = self.prepared.remove(&token) {
                 self.prepared_targets.remove(&prepared.target);
+                self.bump_revision();
             }
         }
+    }
+
+    fn bump_revision(&mut self) {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("scenario controller revision space is exhausted");
     }
 
     fn expire_transient_actions(&mut self, sample_index: u64) {
@@ -589,6 +687,25 @@ impl ScenarioController {
                 || !is_expired_at(active, sample_index)
         });
     }
+}
+
+impl PreparedScenarioAction {
+    fn snapshot(&self, token: ActivationToken, now: Instant) -> PreparedScenarioSnapshot {
+        PreparedScenarioSnapshot {
+            token,
+            confirm_expires_in_ms: confirmation_expires_in_ms(self.expires_at, now),
+            target: self.target,
+            action: self.action.snapshot(),
+            actor_label: self.actor_label.clone(),
+        }
+    }
+}
+
+fn confirmation_expires_in_ms(expires_at: Instant, now: Instant) -> u64 {
+    let Some(remaining) = expires_at.checked_duration_since(now) else {
+        return 0;
+    };
+    u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn validate_controller_target(target: ScenarioTarget) -> Result<(), ScenarioControllerError> {
@@ -602,6 +719,15 @@ fn validate_controller_name(name: &str) -> Result<(), ScenarioControllerError> {
     validate_name(name).map_err(|_| ScenarioControllerError::InvalidScenarioName {
         name: name.to_owned(),
     })
+}
+
+pub fn validate_actor_label(actor_label: Option<&str>) -> Result<(), ScenarioControllerError> {
+    if actor_label.is_some_and(|label| label.len() > MAX_SCENARIO_ACTOR_LABEL_BYTES) {
+        return Err(ScenarioControllerError::InvalidActorLabel {
+            maximum: MAX_SCENARIO_ACTOR_LABEL_BYTES,
+        });
+    }
+    Ok(())
 }
 
 fn validate_scenario_target(
@@ -735,6 +861,11 @@ fn compile_catalog(catalog: RawScenarioCatalog) -> Result<ScenarioCatalog, Scena
             "scenario catalog must define at least one scenario",
         ));
     }
+    if catalog.scenarios.len() > MAX_SCENARIO_CATALOG_ENTRIES {
+        return Err(ScenarioCatalogError::new(format!(
+            "scenario catalog must define no more than {MAX_SCENARIO_CATALOG_ENTRIES} scenarios to fit the management response limit"
+        )));
+    }
 
     let mut scenarios = Vec::with_capacity(catalog.scenarios.len());
     for raw in catalog.scenarios {
@@ -853,11 +984,12 @@ fn validate_name(name: &str) -> Result<(), ScenarioCatalogError> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use super::{
         parse_catalog, FramePlan, ScenarioController, ScenarioControllerError, ScenarioKind,
-        ScenarioLifecycle, ScenarioTarget, ACTIVATION_TOKEN_TTL, SCENARIO_CATALOG_VERSION,
+        ScenarioLifecycle, ScenarioTarget, ACTIVATION_TOKEN_TTL, MAX_SCENARIO_CATALOG_ENTRIES,
+        MAX_SCENARIO_ACTOR_LABEL_BYTES, MAX_SCENARIO_TARGETS, SCENARIO_CATALOG_VERSION,
     };
 
     const BASELINE_CATALOG: &str = include_str!("../scenarios/baseline.yaml");
@@ -909,6 +1041,51 @@ scenarios:
     }
 
     #[test]
+    fn catalog_content_identity_changes_for_valid_content() {
+        let baseline = parse_catalog(BASELINE_CATALOG).expect("baseline catalog compiles");
+        let changed = parse_catalog(&BASELINE_CATALOG.replacen(
+            "start_frame_offset: 0",
+            "start_frame_offset: 1",
+            1,
+        ))
+        .expect("changed catalog compiles");
+
+        let baseline_identity = baseline.content_sha256();
+        assert_eq!(baseline_identity.len(), 64);
+        assert!(baseline_identity.bytes().all(|byte| {
+            byte.is_ascii_digit() || (byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())
+        }));
+        assert_ne!(baseline_identity, changed.content_sha256());
+    }
+
+    #[test]
+    fn bounds_actor_labels_at_controller_ingress_without_changing_empty_labels() {
+        let now = Instant::now();
+        let mut controller = controller();
+
+        let error = controller
+            .prepare_activation(
+                endpoint(1001),
+                "degraded-time",
+                Some("x".repeat(MAX_SCENARIO_ACTOR_LABEL_BYTES + 1)),
+                now,
+            )
+            .expect_err("oversized actor labels must be rejected");
+        assert!(matches!(
+            error,
+            ScenarioControllerError::InvalidActorLabel {
+                maximum: MAX_SCENARIO_ACTOR_LABEL_BYTES
+            }
+        ));
+        assert!(controller.prepared_actions().is_empty());
+
+        let prepared = controller
+            .prepare_activation(endpoint(1001), "degraded-time", Some(String::new()), now)
+            .expect("empty actor labels retain their existing behavior");
+        assert_eq!(prepared.actor_label.as_deref(), Some(""));
+    }
+
+    #[test]
     fn rejects_unknown_catalog_fields() {
         let contents = BASELINE_CATALOG.replace("version: 1", "version: 1\nunknown: true");
 
@@ -924,6 +1101,20 @@ scenarios:
         let error = parse_catalog(&contents).expect_err("duplicate names must fail");
 
         assert!(error.to_string().contains("duplicate scenario names"));
+    }
+
+    #[test]
+    fn rejects_catalogs_that_exceed_the_management_response_bound() {
+        let mut contents = String::from("version: 1\nscenarios:\n");
+        for index in 0..=MAX_SCENARIO_CATALOG_ENTRIES {
+            contents.push_str(&format!(
+                "  - name: scenario-{index}\n    kind: normal\n    start_frame_offset: 0\n    lifecycle: sustained\n"
+            ));
+        }
+
+        let error = parse_catalog(&contents).expect_err("oversized catalog must fail at compile time");
+
+        assert!(error.to_string().contains("management response limit"));
     }
 
     #[test]
@@ -1050,6 +1241,39 @@ scenarios:
     }
 
     #[test]
+    fn rejects_scenario_targets_beyond_the_bounded_state_capacity() {
+        let now = Instant::now();
+        let mut controller = controller();
+
+        for stream_id in 1..=150 {
+            controller
+                .prepare_activation(endpoint(stream_id), "normal", None, now)
+                .expect("endpoint target must fit the state capacity");
+            for connection_id in 1..=2 {
+                controller
+                    .prepare_activation(
+                        pdc(stream_id, connection_id),
+                        "disconnect-pdc",
+                        None,
+                        now,
+                    )
+                    .expect("PDC target must fit the state capacity");
+            }
+        }
+
+        let error = controller
+            .prepare_activation(endpoint(151), "normal", None, now)
+            .expect_err("additional target must exceed the state capacity");
+
+        assert!(matches!(
+            error,
+            ScenarioControllerError::TargetCapacityExceeded {
+                maximum: MAX_SCENARIO_TARGETS
+            }
+        ));
+    }
+
+    #[test]
     fn expired_tokens_are_rejected_consumed_and_release_the_target() {
         let now = Instant::now();
         let mut controller = controller();
@@ -1075,6 +1299,101 @@ scenarios:
                 now + ACTIVATION_TOKEN_TTL,
             )
             .expect("expired preparation releases its target");
+    }
+
+    #[test]
+    fn cancel_consumes_live_preparations_releases_targets_and_is_one_shot() {
+        let now = Instant::now();
+        let mut controller = controller();
+        let prepared = controller
+            .prepare_activation(
+                endpoint(1001),
+                "degraded-time",
+                Some("preparer".to_owned()),
+                now,
+            )
+            .expect("activation prepares");
+        assert_eq!(prepared.confirm_expires_in_ms, 60_000);
+        assert_eq!(
+            serde_json::to_value(&prepared)
+                .expect("prepared snapshot serializes")["token"]
+                .as_str(),
+            Some("1")
+        );
+
+        let cancelled = controller
+            .cancel(prepared.token, now + Duration::from_millis(250))
+            .expect("live preparation cancels");
+        assert_eq!(cancelled.actor_label.as_deref(), Some("preparer"));
+        assert_eq!(cancelled.confirm_expires_in_ms, 59_750);
+        assert!(controller.prepared_actions().is_empty());
+        assert!(controller.pending_actions().is_empty());
+        assert!(controller.active_scenarios().is_empty());
+
+        let retry = controller
+            .cancel(prepared.token, now + Duration::from_millis(250))
+            .expect_err("cancellation is one-shot");
+        assert!(matches!(retry, ScenarioControllerError::UnknownToken { .. }));
+        controller
+            .prepare_activation(endpoint(1001), "missing-frames", None, now)
+            .expect("cancellation releases its target");
+    }
+
+    #[test]
+    fn cancelling_an_expired_preparation_consumes_it_and_releases_its_target() {
+        let now = Instant::now();
+        let mut controller = controller();
+        let prepared = controller
+            .prepare_activation(endpoint(1001), "degraded-time", None, now)
+            .expect("activation prepares");
+
+        let expired = controller
+            .cancel(prepared.token, now + ACTIVATION_TOKEN_TTL)
+            .expect_err("expired preparation cannot be cancelled");
+        assert!(matches!(expired, ScenarioControllerError::ExpiredToken { .. }));
+        let retry = controller
+            .cancel(prepared.token, now + ACTIVATION_TOKEN_TTL)
+            .expect_err("expired cancellation is one-shot");
+        assert!(matches!(retry, ScenarioControllerError::UnknownToken { .. }));
+        controller
+            .prepare_activation(endpoint(1001), "missing-frames", None, now + ACTIVATION_TOKEN_TTL)
+            .expect("expired cancellation releases its target");
+    }
+
+    #[test]
+    fn confirmation_and_cancellation_are_resolved_by_the_first_token_consumer() {
+        let now = Instant::now();
+        let mut confirmed_first = controller();
+        let confirmed = confirmed_first
+            .prepare_activation(endpoint(1001), "degraded-time", None, now)
+            .expect("activation prepares");
+        confirmed_first
+            .confirm(confirmed.token, now)
+            .expect("confirmation consumes the token");
+        let cancelled_after_confirmation = confirmed_first
+            .cancel(confirmed.token, now)
+            .expect_err("confirmed token cannot be cancelled");
+        assert!(matches!(
+            cancelled_after_confirmation,
+            ScenarioControllerError::UnknownToken { .. }
+        ));
+        assert_eq!(confirmed_first.pending_actions().len(), 1);
+
+        let mut cancelled_first = controller();
+        let cancelled = cancelled_first
+            .prepare_activation(endpoint(1001), "degraded-time", None, now)
+            .expect("activation prepares");
+        cancelled_first
+            .cancel(cancelled.token, now)
+            .expect("cancellation consumes the token");
+        let confirmed_after_cancellation = cancelled_first
+            .confirm(cancelled.token, now)
+            .expect_err("cancelled token cannot be confirmed");
+        assert!(matches!(
+            confirmed_after_cancellation,
+            ScenarioControllerError::UnknownToken { .. }
+        ));
+        assert!(cancelled_first.pending_actions().is_empty());
     }
 
     #[test]

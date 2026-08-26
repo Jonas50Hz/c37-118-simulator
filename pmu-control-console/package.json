@@ -1,0 +1,9 @@
+{
+  "private": true,
+  "scripts": {
+    "test:poll-open-select": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.55.0"
+  }
+}

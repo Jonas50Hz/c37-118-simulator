@@ -36,11 +36,9 @@ pub struct PrepareScenarioRequest {
     pub actor_label: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfirmScenarioRequest {
     pub token: u64,
-    #[serde(default)]
     pub actor_label: Option<String>,
 }
 
@@ -53,14 +51,38 @@ pub struct ClearScenarioRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelScenarioRequest {
+    pub token: u64,
+    pub actor_label: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScenarioTokenRequestBody {
+    token: serde_json::Value,
+    #[serde(default)]
+    actor_label: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsoleStateCursor {
+    pub process_identity: String,
+    pub controller_revision: u64,
+    pub offset: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagementRequest {
     Healthz,
     Readyz,
     Metrics,
+    Catalog,
     State,
+    ConsoleState { cursor: Option<ConsoleStateCursor> },
     Prepare(PrepareScenarioRequest),
     Confirm(ConfirmScenarioRequest),
     Clear(ClearScenarioRequest),
+    Cancel(CancelScenarioRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +122,7 @@ pub enum ParseError {
     InvalidJsonBody,
     InvalidTarget,
     InvalidToken,
+    InvalidQuery,
 }
 
 impl ParseError {
@@ -127,6 +150,7 @@ impl ParseError {
             Self::InvalidJsonBody => "invalid_json_body",
             Self::InvalidTarget => "invalid_target",
             Self::InvalidToken => "invalid_token",
+            Self::InvalidQuery => "invalid_query",
         }
     }
 
@@ -158,6 +182,7 @@ impl ParseError {
             Self::InvalidJsonBody => "request body must be a valid JSON object",
             Self::InvalidTarget => "target stream_id must be greater than zero",
             Self::InvalidToken => "token must be greater than zero",
+            Self::InvalidQuery => "query parameters are not valid for this endpoint",
         }
     }
 
@@ -184,7 +209,8 @@ impl ParseError {
             | Self::TrailingData
             | Self::InvalidJsonBody
             | Self::InvalidTarget
-            | Self::InvalidToken => StatusCode::BadRequest,
+            | Self::InvalidToken
+            | Self::InvalidQuery => StatusCode::BadRequest,
         }
     }
 
@@ -212,6 +238,7 @@ pub enum StatusCode {
     BadRequest,
     NotFound,
     MethodNotAllowed,
+    NotAcceptable,
     PayloadTooLarge,
     UnsupportedMediaType,
     InternalServerError,
@@ -227,6 +254,7 @@ impl StatusCode {
             Self::BadRequest => (400, "Bad Request"),
             Self::NotFound => (404, "Not Found"),
             Self::MethodNotAllowed => (405, "Method Not Allowed"),
+            Self::NotAcceptable => (406, "Not Acceptable"),
             Self::PayloadTooLarge => (413, "Payload Too Large"),
             Self::UnsupportedMediaType => (415, "Unsupported Media Type"),
             Self::InternalServerError => (500, "Internal Server Error"),
@@ -324,10 +352,15 @@ pub fn parse(input: &[u8]) -> ParseOutcome {
         Route::Healthz => ParseOutcome::Complete(ManagementRequest::Healthz),
         Route::Readyz => ParseOutcome::Complete(ManagementRequest::Readyz),
         Route::Metrics => ParseOutcome::Complete(ManagementRequest::Metrics),
+        Route::Catalog => ParseOutcome::Complete(ManagementRequest::Catalog),
         Route::State => ParseOutcome::Complete(ManagementRequest::State),
+        Route::ConsoleState(cursor) => ParseOutcome::Complete(ManagementRequest::ConsoleState {
+            cursor,
+        }),
         Route::Prepare => parse_prepare(body),
         Route::Confirm => parse_confirm(body),
         Route::Clear => parse_clear(body),
+        Route::Cancel => parse_cancel(body),
     }
 }
 
@@ -382,20 +415,23 @@ pub fn empty_response(status: StatusCode) -> Vec<u8> {
         .expect("an empty response cannot exceed the response body limit")
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Route {
     Healthz,
     Readyz,
     Metrics,
+    Catalog,
     State,
+    ConsoleState(Option<ConsoleStateCursor>),
     Prepare,
     Confirm,
     Clear,
+    Cancel,
 }
 
 impl Route {
-    const fn requires_json_body(self) -> bool {
-        matches!(self, Self::Prepare | Self::Confirm | Self::Clear)
+    const fn requires_json_body(&self) -> bool {
+        matches!(self, Self::Prepare | Self::Confirm | Self::Clear | Self::Cancel)
     }
 }
 
@@ -527,12 +563,22 @@ fn is_valid_host(value: &[u8]) -> bool {
             .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
 }
 
-fn route_for(method: Option<&str>, path: Option<&str>) -> Result<Route, ParseError> {
+fn route_for(method: Option<&str>, request_target: Option<&str>) -> Result<Route, ParseError> {
     let method = method.ok_or(ParseError::MalformedRequest)?;
-    let path = path.ok_or(ParseError::MalformedRequest)?;
+    let request_target = request_target.ok_or(ParseError::MalformedRequest)?;
+    let (path, query) = match request_target.split_once('?') {
+        Some((path, query)) if !query.contains('?') => (path, Some(query)),
+        Some(_) => return Err(ParseError::InvalidQuery),
+        None => (request_target, None),
+    };
     let allowed = match path {
-        "/healthz" | "/readyz" | "/metrics" | "/v1/state" => AllowedMethod::Get,
-        "/v1/scenarios/prepare" | "/v1/scenarios/confirm" | "/v1/scenarios/clear" => {
+        "/healthz" | "/readyz" | "/metrics" | "/v1/catalog" | "/v1/state" => {
+            AllowedMethod::Get
+        }
+        "/v1/scenarios/prepare"
+        | "/v1/scenarios/confirm"
+        | "/v1/scenarios/clear"
+        | "/v1/scenarios/cancel" => {
             AllowedMethod::Post
         }
         _ => return Err(ParseError::UnknownPath),
@@ -542,16 +588,78 @@ fn route_for(method: Option<&str>, path: Option<&str>) -> Result<Route, ParseErr
     {
         return Err(ParseError::MethodNotAllowed(allowed));
     }
-    match path {
-        "/healthz" => Ok(Route::Healthz),
-        "/readyz" => Ok(Route::Readyz),
-        "/metrics" => Ok(Route::Metrics),
-        "/v1/state" => Ok(Route::State),
-        "/v1/scenarios/prepare" => Ok(Route::Prepare),
-        "/v1/scenarios/confirm" => Ok(Route::Confirm),
-        "/v1/scenarios/clear" => Ok(Route::Clear),
+    match (path, query) {
+        ("/healthz", None) => Ok(Route::Healthz),
+        ("/readyz", None) => Ok(Route::Readyz),
+        ("/metrics", None) => Ok(Route::Metrics),
+        ("/v1/catalog", None) => Ok(Route::Catalog),
+        ("/v1/state", None) => Ok(Route::State),
+        ("/v1/state", Some(query)) => parse_console_state_route(query),
+        ("/v1/scenarios/prepare", None) => Ok(Route::Prepare),
+        ("/v1/scenarios/confirm", None) => Ok(Route::Confirm),
+        ("/v1/scenarios/clear", None) => Ok(Route::Clear),
+        ("/v1/scenarios/cancel", None) => Ok(Route::Cancel),
+        (_, Some(_)) => Err(ParseError::InvalidQuery),
         _ => unreachable!("known route must map to a route value"),
     }
+}
+
+fn parse_console_state_route(query: &str) -> Result<Route, ParseError> {
+    if query.is_empty() {
+        return Err(ParseError::InvalidQuery);
+    }
+
+    let mut format = None;
+    let mut cursor = None;
+    for parameter in query.split('&') {
+        let Some((name, value)) = parameter.split_once('=') else {
+            return Err(ParseError::InvalidQuery);
+        };
+        match name {
+            "format" if format.replace(value).is_none() => {}
+            "cursor" if cursor.replace(parse_console_cursor(value)?).is_none() => {}
+            _ => return Err(ParseError::InvalidQuery),
+        }
+    }
+
+    if format == Some("console-v1") {
+        Ok(Route::ConsoleState(cursor))
+    } else {
+        Err(ParseError::InvalidQuery)
+    }
+}
+
+fn parse_console_cursor(value: &str) -> Result<ConsoleStateCursor, ParseError> {
+    let mut parts = value.split(':');
+    let process_identity = parts.next().ok_or(ParseError::InvalidQuery)?;
+    let controller_revision = parse_decimal_u64(parts.next().ok_or(ParseError::InvalidQuery)?)?;
+    let offset = usize::try_from(parse_decimal_u64(parts.next().ok_or(ParseError::InvalidQuery)?)?)
+        .map_err(|_| ParseError::InvalidQuery)?;
+    if parts.next().is_some()
+        || process_identity.len() != 64
+        || !process_identity.bytes().all(|byte| {
+            byte.is_ascii_digit() || (byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())
+        })
+    {
+        return Err(ParseError::InvalidQuery);
+    }
+    Ok(ConsoleStateCursor {
+        process_identity: process_identity.to_owned(),
+        controller_revision,
+        offset,
+    })
+}
+
+fn parse_decimal_u64(value: &str) -> Result<u64, ParseError> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ParseError::InvalidQuery);
+    }
+    value.bytes().try_fold(0_u64, |number, byte| {
+        number
+            .checked_mul(10)
+            .and_then(|number| number.checked_add(u64::from(byte - b'0')))
+            .ok_or(ParseError::InvalidQuery)
+    })
 }
 
 fn is_json_content_type(value: &[u8]) -> bool {
@@ -582,14 +690,17 @@ fn parse_prepare(body: &[u8]) -> ParseOutcome {
 }
 
 fn parse_confirm(body: &[u8]) -> ParseOutcome {
-    let request = match parse_json_body::<ConfirmScenarioRequest>(body) {
+    let (token, actor_label) = match parse_scenario_token_request(
+        body,
+        parse_legacy_compatible_scenario_token,
+    ) {
         Ok(request) => request,
         Err(error) => return ParseOutcome::Error(error),
     };
-    if request.token == 0 {
-        return ParseOutcome::Error(ParseError::InvalidToken);
-    }
-    ParseOutcome::Complete(ManagementRequest::Confirm(request))
+    ParseOutcome::Complete(ManagementRequest::Confirm(ConfirmScenarioRequest {
+        token,
+        actor_label,
+    }))
 }
 
 fn parse_clear(body: &[u8]) -> ParseOutcome {
@@ -601,6 +712,56 @@ fn parse_clear(body: &[u8]) -> ParseOutcome {
         return ParseOutcome::Error(ParseError::InvalidTarget);
     }
     ParseOutcome::Complete(ManagementRequest::Clear(request))
+}
+
+fn parse_cancel(body: &[u8]) -> ParseOutcome {
+    let (token, actor_label) = match parse_scenario_token_request(body, parse_canonical_scenario_token)
+    {
+        Ok(request) => request,
+        Err(error) => return ParseOutcome::Error(error),
+    };
+    ParseOutcome::Complete(ManagementRequest::Cancel(CancelScenarioRequest {
+        token,
+        actor_label,
+    }))
+}
+
+fn parse_scenario_token_request(
+    body: &[u8],
+    parse_token: fn(serde_json::Value) -> Option<u64>,
+) -> Result<(u64, Option<String>), ParseError> {
+    let request = parse_json_body::<ScenarioTokenRequestBody>(body)?;
+    let token = parse_token(request.token).ok_or(ParseError::InvalidToken)?;
+    Ok((token, request.actor_label))
+}
+
+fn parse_legacy_compatible_scenario_token(token: serde_json::Value) -> Option<u64> {
+    match token {
+        serde_json::Value::String(token) => parse_canonical_decimal_token(&token),
+        serde_json::Value::Number(token) => parse_canonical_decimal_token(&token.to_string()),
+        _ => None,
+    }
+}
+
+fn parse_canonical_scenario_token(token: serde_json::Value) -> Option<u64> {
+    let serde_json::Value::String(token) = token else {
+        return None;
+    };
+    parse_canonical_decimal_token(&token)
+}
+
+fn parse_canonical_decimal_token(token: &str) -> Option<u64> {
+    let bytes = token.as_bytes();
+    if !matches!(bytes.first(), Some(b'1'..=b'9'))
+        || !bytes.iter().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    bytes.iter().try_fold(0_u64, |value, byte| {
+        value
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(u64::from(*byte - b'0')))
+    })
 }
 
 fn json_response<T: Serialize>(
@@ -718,6 +879,7 @@ mod tests {
             ("/healthz", ManagementRequest::Healthz),
             ("/readyz", ManagementRequest::Readyz),
             ("/metrics", ManagementRequest::Metrics),
+            ("/v1/catalog", ManagementRequest::Catalog),
             ("/v1/state", ManagementRequest::State),
         ] {
             assert_eq!(
@@ -725,6 +887,25 @@ mod tests {
                 expected
             );
         }
+        assert_eq!(
+            complete(
+                b"GET /v1/state?format=console-v1 HTTP/1.1\r\nHost: simulator\r\n\r\n",
+            ),
+            ManagementRequest::ConsoleState { cursor: None }
+        );
+        assert_eq!(
+            complete(
+                b"GET /v1/state?cursor=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:7:48&format=console-v1 HTTP/1.1\r\nHost: simulator\r\n\r\n",
+            ),
+            ManagementRequest::ConsoleState {
+                cursor: Some(ConsoleStateCursor {
+                    process_identity: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_owned(),
+                    controller_revision: 7,
+                    offset: 48,
+                }),
+            }
+        );
         assert_eq!(
             complete(&json_post(
                 "/v1/scenarios/prepare",
@@ -737,6 +918,13 @@ mod tests {
                 },
                 scenario_name: "missing-frames".to_owned(),
                 actor_label: Some("operator".to_owned()),
+            })
+        );
+        assert_eq!(
+            complete(&json_post("/v1/scenarios/confirm", r#"{"token":"19"}"#)),
+            ManagementRequest::Confirm(ConfirmScenarioRequest {
+                token: 19,
+                actor_label: None,
             })
         );
         assert_eq!(
@@ -753,6 +941,76 @@ mod tests {
                     stream_id: 1001,
                     connection_id: None,
                 },
+                actor_label: None,
+            })
+        );
+        assert_eq!(
+            complete(&json_post(
+                "/v1/scenarios/cancel",
+                r#"{"token":"19","actor_label":"canceller"}"#,
+            )),
+            ManagementRequest::Cancel(CancelScenarioRequest {
+                token: 19,
+                actor_label: Some("canceller".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn scenario_token_routes_allow_legacy_numbers_only_for_confirmation() {
+        assert_eq!(
+            complete(&json_post("/v1/scenarios/confirm", r#"{"token":19}"#)),
+            ManagementRequest::Confirm(ConfirmScenarioRequest {
+                token: 19,
+                actor_label: None,
+            })
+        );
+        assert_error(
+            &json_post("/v1/scenarios/cancel", r#"{"token":19}"#),
+            ParseError::InvalidToken,
+        );
+        assert_eq!(
+            complete(&json_post("/v1/scenarios/cancel", r#"{"token":"19"}"#)),
+            ManagementRequest::Cancel(CancelScenarioRequest {
+                token: 19,
+                actor_label: None,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_noncanonical_or_invalid_scenario_tokens() {
+        for token in [
+            "0",
+            "-1",
+            "1.0",
+            "1e0",
+            "true",
+            "null",
+            "\"0\"",
+            "\"01\"",
+            "\"+1\"",
+            "\" 1\"",
+            "\"1 \"",
+            "\"18446744073709551616\"",
+        ] {
+            let body = format!(r#"{{"token":{token}}}"#);
+            assert_error(
+                &json_post("/v1/scenarios/confirm", &body),
+                ParseError::InvalidToken,
+            );
+            assert_error(
+                &json_post("/v1/scenarios/cancel", &body),
+                ParseError::InvalidToken,
+            );
+        }
+        assert_eq!(
+            complete(&json_post(
+                "/v1/scenarios/confirm",
+                r#"{"token":"18446744073709551615"}"#,
+            )),
+            ManagementRequest::Confirm(ConfirmScenarioRequest {
+                token: u64::MAX,
                 actor_label: None,
             })
         );
@@ -825,6 +1083,19 @@ mod tests {
         let (headers, _) = response_parts(&unknown);
         assert!(headers.starts_with("HTTP/1.1 404 Not Found"));
         assert!(!headers.contains("\r\nAllow:"));
+    }
+
+    #[test]
+    fn rejects_unknown_or_malformed_console_state_queries() {
+        for request in [
+            b"GET /v1/state?format=console-v2 HTTP/1.1\r\nHost: simulator\r\n\r\n".as_slice(),
+            b"GET /v1/state?format=console-v1&unknown=value HTTP/1.1\r\nHost: simulator\r\n\r\n",
+            b"GET /v1/state?format=console-v1&format=console-v1 HTTP/1.1\r\nHost: simulator\r\n\r\n",
+            b"GET /v1/state?format=console-v1&cursor=not-a-cursor HTTP/1.1\r\nHost: simulator\r\n\r\n",
+            b"GET /v1/catalog?format=console-v1 HTTP/1.1\r\nHost: simulator\r\n\r\n",
+        ] {
+            assert_error(request, ParseError::InvalidQuery);
+        }
     }
 
     #[test]

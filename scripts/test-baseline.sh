@@ -760,9 +760,39 @@ if (
 ):
   raise SystemExit("prepare response did not contain the expected scenario")
 token = response.get("token")
-if not isinstance(token, int) or token <= 0:
+if not isinstance(token, str) or not token.isascii() or not token.isdecimal() or int(token) <= 0:
     raise SystemExit("prepare response did not contain a valid token")
+confirm_expires_in_ms = response.get("confirm_expires_in_ms")
+if not isinstance(confirm_expires_in_ms, int) or confirm_expires_in_ms <= 0:
+    raise SystemExit("prepare response did not contain a valid confirmation expiry")
 print(token)
+PY
+}
+
+cancel_response_has_scenario() {
+  local response_path="$1"
+  local connection_id="$2"
+
+  python3 - "$response_path" "$connection_id" <<'PY'
+import json
+import sys
+
+response_path, connection_id = sys.argv[1:]
+with open(response_path, encoding="utf-8") as source:
+    response = json.load(source)
+
+expected_target = {
+  "pdc": {"stream_id": 1001, "connection_id": int(connection_id)}
+}
+if (
+  response.get("target") != expected_target
+  or response.get("action") != {"activate": {"scenario_name": "disconnect-pdc"}}
+  or response.get("actor_label") != "baseline"
+):
+    raise SystemExit("cancel response did not contain the expected scenario")
+confirm_expires_in_ms = response.get("confirm_expires_in_ms")
+if not isinstance(confirm_expires_in_ms, int) or confirm_expires_in_ms <= 0:
+    raise SystemExit("cancel response did not contain a valid confirmation expiry")
 PY
 }
 
@@ -1327,6 +1357,8 @@ for wire_version in "${selected_wire_versions[@]}"; do
   active_memory_metrics_path="$scratch_directory/active-memory-v${wire_version}.txt"
   idle_final_state_path="$scratch_directory/idle-final-v${wire_version}.json"
   prepare_response_path="$scratch_directory/prepare-v${wire_version}.json"
+  cancel_response_path="$scratch_directory/cancel-v${wire_version}.json"
+  canceled_confirm_response_path="$scratch_directory/canceled-confirm-v${wire_version}.json"
   confirm_response_path="$scratch_directory/confirm-v${wire_version}.json"
   probe_a_log_path="$scratch_directory/probe-a-v${wire_version}.log"
   probe_b_log_path="$scratch_directory/probe-b-v${wire_version}.log"
@@ -1386,10 +1418,38 @@ for wire_version in "${selected_wire_versions[@]}"; do
   set_record_value "$current_version_record" "active.scenario.prepare_http_status" int "$prepare_http_status"
   scenario_token="$(prepare_token_from_response "$prepare_response_path" "$target_connection_id")" || \
     fatal "scenario prepare response was invalid for wire version $wire_version"
-  set_record_value "$current_version_record" "active.scenario.token" int "$scenario_token"
+  set_record_value "$current_version_record" "active.scenario.token" string "$scenario_token"
   set_record_value "$current_version_record" "active.scenario.status" string "prepared"
 
-  confirm_payload="$(printf '{"token":%s,"actor_label":"baseline"}' "$scenario_token")"
+  cancel_payload="$(printf '{"token":"%s","actor_label":"baseline"}' "$scenario_token")"
+  cancel_http_status="$(management_post_json "$active_management_port" \
+    "/v1/scenarios/cancel" "$cancel_payload" "$cancel_response_path")" || \
+    fatal "scenario cancel request failed for wire version $wire_version"
+  if [[ "$cancel_http_status" != "202" ]]; then
+    fatal "scenario cancel request returned HTTP $cancel_http_status for wire version $wire_version"
+  fi
+  if ! cancel_response_has_scenario "$cancel_response_path" "$target_connection_id"; then
+    fatal "scenario cancel response was invalid for wire version $wire_version"
+  fi
+  canceled_token="$scenario_token"
+  prepare_http_status="$(management_post_json "$active_management_port" \
+    "/v1/scenarios/prepare" "$prepare_payload" "$prepare_response_path")" || \
+    fatal "scenario re-prepare request failed after cancel for wire version $wire_version"
+  if [[ "$prepare_http_status" != "202" ]]; then
+    fatal "scenario target was not released by cancel for wire version $wire_version"
+  fi
+  scenario_token="$(prepare_token_from_response "$prepare_response_path" "$target_connection_id")" || \
+    fatal "scenario re-prepare response was invalid for wire version $wire_version"
+
+  canceled_confirm_payload="$(printf '{"token":"%s","actor_label":"baseline"}' "$canceled_token")"
+  canceled_confirm_http_status="$(management_post_json "$active_management_port" \
+    "/v1/scenarios/confirm" "$canceled_confirm_payload" "$canceled_confirm_response_path")" || \
+    fatal "scenario canceled-token confirmation request failed for wire version $wire_version"
+  if [[ "$canceled_confirm_http_status" != "409" ]]; then
+    fatal "scenario canceled-token confirmation returned HTTP $canceled_confirm_http_status for wire version $wire_version"
+  fi
+
+  confirm_payload="$(printf '{"token":"%s","actor_label":"baseline"}' "$scenario_token")"
   confirm_http_status="$(management_post_json "$active_management_port" \
     "/v1/scenarios/confirm" "$confirm_payload" "$confirm_response_path")" || \
     fatal "scenario confirm request failed for wire version $wire_version"

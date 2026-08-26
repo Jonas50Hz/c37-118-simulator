@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>PMU Control Console</title>
+    <link rel="stylesheet" href="styles.css">
+    <script type="module" src="app.js"></script>
+  </head>
+  <body>
+    <main class="desktop-guard" aria-labelledby="desktop-guard-title">
+      <section class="desktop-guard__content">
+        <p class="eyebrow">PMU Control Console</p>
+        <h1 id="desktop-guard-title">Desktop display required</h1>
+        <p>This operational console is available at 1024px and wider.</p>
+      </section>
+    </main>
+
+    <div class="console-shell" id="console-app">
+      <header class="console-header">
+        <div class="console-header__title">
+          <p class="eyebrow">C37.118 Simulator</p>
+          <h1>PMU Control Console</h1>
+        </div>
+
+        <dl class="connection-summary" aria-label="Console connection summary">
+          <div class="connection-summary__item">
+            <dt>Connection</dt>
+            <dd id="connection-state" class="connection-state connection-state--unavailable">Unavailable</dd>
+          </div>
+          <div class="connection-summary__item">
+            <dt>Last successful update</dt>
+            <dd id="last-success">No successful update</dd>
+          </div>
+          <div class="connection-summary__item connection-summary__item--identity">
+            <dt>Catalog identity</dt>
+            <dd id="catalog-identity" class="identity-value">No catalog bound</dd>
+          </div>
+        </dl>
+
+        <p id="console-status" class="console-status console-status--unavailable" role="status" aria-live="polite" aria-atomic="true">
+          Unavailable. No coherent snapshot is available.
+        </p>
+        <p id="operation-status" class="operation-status" role="status" aria-live="polite" aria-atomic="true" hidden></p>
+      </header>
+
+      <main id="console-content" class="console-content" aria-live="off">
+        <section class="empty-state" aria-labelledby="empty-state-title">
+          <p class="eyebrow">State</p>
+          <h2 id="empty-state-title">No coherent console snapshot</h2>
+          <p>Live PMU and scenario data will appear after a complete read-only snapshot is available.</p>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="scenario-dialog" class="scenario-dialog" aria-labelledby="scenario-dialog-title">
+      <div id="scenario-dialog-content" class="scenario-dialog__content"></div>
+    </dialog>
+  </body>
+</html>

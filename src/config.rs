@@ -223,12 +223,10 @@ fn compile_profile(profile: Profile) -> Result<CompiledProfile, ConfigError> {
     }
     let _ = (final_stream_id, final_pmu_id);
 
-    let (pdc_name, channel_names): (Vec<u8>, Vec<Vec<u8>>) = match wire_version {
-        WireVersion::V2 => (Vec::new(), Vec::new()),
-        WireVersion::V3 => (
-            encoded_name(&profile.fleet.pdc_name, "fleet.pdc_name")?,
-            standard_channel_names()?,
-        ),
+    let pdc_name = encoded_name(&profile.fleet.pdc_name, "fleet.pdc_name")?;
+    let channel_names = match wire_version {
+        WireVersion::V2 => Vec::new(),
+        WireVersion::V3 => standard_channel_names()?,
     };
     let v2_channel_names = match wire_version {
         WireVersion::V2 => Some(standard_v2_channel_names()?),
@@ -545,6 +543,11 @@ fn encoded_name(value: &str, field: &str) -> Result<Vec<u8>, ConfigError> {
             "{field} must contain 1 to 255 UTF-8 bytes"
         )));
     }
+    if value.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(ConfigError::new(format!(
+            "{field} must not contain ASCII control characters"
+        )));
+    }
     let mut encoded = Vec::with_capacity(value.len() + 1);
     encoded.push(value.len() as u8);
     encoded.extend_from_slice(value.as_bytes());
@@ -665,7 +668,20 @@ mod tests {
     }
 
     #[test]
-    fn compiles_compact_v2_metadata_without_retaining_v3_names() {
+    fn rejects_ascii_control_characters_in_browser_name_fields() {
+        let pdc_error = parse_profile(&profile(1).replace("pdc_name: WAMA", "pdc_name: \"WA\\nMA\""))
+            .expect_err("PDC names with controls must fail at profile compilation");
+        assert!(pdc_error.to_string().contains("ASCII control"));
+
+        let pmu_error = parse_profile(
+            &profile(1).replace("pmu_name_prefix: WAMA-PMU-", "pmu_name_prefix: \"WAMA\\u007f\""),
+        )
+        .expect_err("PMU names with controls must fail at profile compilation");
+        assert!(pmu_error.to_string().contains("ASCII control"));
+    }
+
+    #[test]
+    fn compiles_compact_v2_wire_metadata_with_the_configured_pdc_name() {
         let contents = profile(1).replace("protocol_version: 3", "protocol_version: 2");
         let endpoint = parse_profile(&contents)
             .expect("V2 profile must compile")
@@ -674,7 +690,7 @@ mod tests {
         let v2 = endpoint.v2.expect("V2 metadata must be present");
 
         assert_eq!(endpoint.wire_version, WireVersion::V2);
-        assert!(endpoint.pdc_name.is_empty());
+        assert_eq!(endpoint.pdc_name, b"\x04WAMA");
         assert!(endpoint.pmu_name.is_empty());
         assert!(endpoint.channel_names.is_empty());
         assert_eq!(endpoint.global_pmu_id, [0; 16]);

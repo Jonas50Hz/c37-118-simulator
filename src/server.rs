@@ -6,6 +6,7 @@ use std::{
     fmt::Write as _,
     io::{self, Read, Write},
     net::SocketAddr,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -18,11 +19,12 @@ use socket2::SockRef;
 use crate::wire_v3::Timestamp;
 use crate::{
     config::{CompiledProfile, EndpointDescriptor, Limits, WireVersion, MAX_COMMAND_FRAME_BYTES},
-    identity::RuntimeIdentity,
+    identity::{sha256_hex, RuntimeIdentity},
     management,
     scenario::{
-        ActivationToken, ScenarioCatalog, ScenarioController, ScenarioControllerSnapshot,
-        ScenarioTarget,
+        ActivationToken, ActiveScenarioSnapshot, PendingScenarioSnapshot,
+        PreparedScenarioSnapshot, ScenarioCatalog, ScenarioController, ScenarioControllerSnapshot,
+        ScenarioKind, ScenarioLifecycle, ScenarioTarget, SignalExcursion,
     },
     time_health::{TimeHealthMonitor, TimeHealthState, TimeSynchronizationSource},
     wire_v2, wire_v3,
@@ -36,6 +38,12 @@ const MANAGEMENT_TOKEN_BASE: usize = usize::MAX / 2 + 1;
 const MANAGEMENT_LISTENER_TOKEN: Token = Token(MANAGEMENT_TOKEN_BASE);
 const FIRST_VALID_COMMAND_DEADLINE: Duration = Duration::from_secs(15);
 const IDLE_NON_STREAMING_DEADLINE: Duration = Duration::from_secs(5 * 60);
+const CONSOLE_LIFECYCLE_RECORDS_PER_PAGE: usize = 48;
+const MAX_RUNTIME_DEPLOYMENT_LABEL_BYTES: usize = 128;
+const MAX_RUNTIME_IMAGE_REFERENCE_BYTES: usize = 255;
+const SHA256_HEX_BYTES: usize = 64;
+
+static NEXT_CONSOLE_PROCESS_INCARNATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ManagementConfig {
@@ -94,12 +102,26 @@ pub struct Server {
     next_management_connection_id: u64,
     ready: bool,
     runtime_metadata: Option<RuntimeMetadata>,
+    console_process_identity: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct RuntimeMetadata {
     deployment_label: String,
     runtime_identity: RuntimeIdentity,
+}
+
+impl RuntimeMetadata {
+    fn new(deployment_label: String, runtime_identity: RuntimeIdentity) -> Option<Self> {
+        (valid_runtime_text(&deployment_label, MAX_RUNTIME_DEPLOYMENT_LABEL_BYTES)
+            && valid_runtime_text(&runtime_identity.image_ref, MAX_RUNTIME_IMAGE_REFERENCE_BYTES)
+            && is_lowercase_sha256(&runtime_identity.profile_sha256)
+            && is_lowercase_sha256(&runtime_identity.scenario_catalog_sha256))
+            .then_some(Self {
+                deployment_label,
+                runtime_identity,
+            })
+    }
 }
 
 struct Endpoint {
@@ -143,6 +165,46 @@ struct ReadinessResponse {
 }
 
 #[derive(serde::Serialize)]
+struct ManagementCatalogResponse {
+    version: u32,
+    content_sha256: String,
+    scenarios: Vec<ManagementCatalogScenario>,
+}
+
+#[derive(serde::Serialize)]
+struct ManagementCatalogScenario {
+    index: usize,
+    name: String,
+    kind: ScenarioKind,
+    target_compatibility: ManagementScenarioTargetCompatibility,
+    lifecycle: ScenarioLifecycle,
+    start_frame_offset: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_frames: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signal: Option<SignalExcursion>,
+}
+
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ManagementScenarioTargetCompatibility {
+    Endpoint,
+    Pdc,
+}
+
+#[derive(serde::Serialize)]
+struct ManagementFleetState {
+    pdc_name: String,
+    pmu_name_prefix: String,
+    wire_version: u8,
+    reporting_rate_hz: u16,
+    nominal_frequency_hz: u16,
+    first_stream_id: u16,
+    first_pmu_id: u16,
+    first_port: u16,
+}
+
+#[derive(serde::Serialize)]
 struct ManagementEndpointState {
     stream_id: u16,
     active_connections: usize,
@@ -156,15 +218,44 @@ struct ManagementPdcState {
 }
 
 #[derive(serde::Serialize)]
+struct ManagementConsoleScenarioControllerState {
+    current_sample_index: Option<u64>,
+    prepared: Vec<PreparedScenarioSnapshot>,
+    pending: Vec<PendingScenarioSnapshot>,
+    active: Vec<ActiveScenarioSnapshot>,
+    prepared_count: usize,
+    pending_count: usize,
+    active_count: usize,
+}
+
+#[derive(serde::Serialize)]
 struct ManagementStateResponse {
     ready: bool,
     time_health: TimeHealthState,
     stats: ServerStats,
+    fleet: ManagementFleetState,
     endpoints: Vec<ManagementEndpointState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     runtime_metadata: Option<RuntimeMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
     scenario_controller: Option<ScenarioControllerSnapshot>,
+}
+
+#[derive(serde::Serialize)]
+struct ManagementConsoleStateResponse {
+    format: &'static str,
+    process_identity: String,
+    controller_revision: u64,
+    catalog_content_sha256: String,
+    ready: bool,
+    time_health: TimeHealthState,
+    stats: ServerStats,
+    fleet: ManagementFleetState,
+    endpoints: Vec<ManagementEndpointState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_metadata: Option<RuntimeMetadata>,
+    scenario_controller: ManagementConsoleScenarioControllerState,
+    next_cursor: Option<String>,
 }
 
 enum EndpointFrames {
@@ -372,15 +463,17 @@ impl Server {
             .and_then(|management| management.listener.local_addr().ok())
     }
 
+    /// Returns false when public metadata is not safe to serialize in management state.
     pub fn configure_runtime_metadata(
         &mut self,
         deployment_label: String,
         runtime_identity: RuntimeIdentity,
-    ) {
-        self.runtime_metadata = Some(RuntimeMetadata {
-            deployment_label,
-            runtime_identity,
-        });
+    ) -> bool {
+        let Some(metadata) = RuntimeMetadata::new(deployment_label, runtime_identity) else {
+            return false;
+        };
+        self.runtime_metadata = Some(metadata);
+        true
     }
 
     fn bind_inner(
@@ -496,6 +589,7 @@ impl Server {
             next_management_connection_id: 1,
             ready,
             runtime_metadata: None,
+            console_process_identity: new_console_process_identity(),
         })
     }
 
@@ -779,13 +873,24 @@ impl Server {
                 ))
             }
             management::ManagementRequest::Metrics => self.management_metrics_response(),
+            management::ManagementRequest::Catalog => self.management_catalog_response(),
             management::ManagementRequest::State => self.management_state_response(),
+            management::ManagementRequest::ConsoleState { cursor } => {
+                self.management_console_state_response(cursor)
+            }
             management::ManagementRequest::Prepare(request) => {
                 let target = scenario_target_from_management(request.target);
                 let actor_label = request.actor_label.clone();
-                let Some(controller) = self.scenario_controller.as_mut() else {
+                if self.scenario_controller.is_none() {
                     return scenario_controller_unavailable_response();
-                };
+                }
+                if !self.scenario_target_is_admitted(target, false) {
+                    return scenario_request_rejected_response();
+                }
+                let controller = self
+                    .scenario_controller
+                    .as_mut()
+                    .expect("scenario controller availability was checked");
                 match controller.prepare_activation(
                     target,
                     request.scenario_name,
@@ -813,6 +918,9 @@ impl Server {
                 let Some(controller) = self.scenario_controller.as_mut() else {
                     return scenario_controller_unavailable_response();
                 };
+                if crate::scenario::validate_actor_label(request.actor_label.as_deref()).is_err() {
+                    return scenario_request_rejected_response();
+                }
                 match controller.confirm(token, Instant::now()) {
                     Ok(snapshot) => {
                         self.log_scenario_action("confirm", request.actor_label.as_deref(), &snapshot);
@@ -827,12 +935,44 @@ impl Server {
             management::ManagementRequest::Clear(request) => {
                 let target = scenario_target_from_management(request.target);
                 let actor_label = request.actor_label.clone();
-                let Some(controller) = self.scenario_controller.as_mut() else {
+                if self.scenario_controller.is_none() {
                     return scenario_controller_unavailable_response();
-                };
+                }
+                if !self.scenario_target_is_admitted(target, true) {
+                    return scenario_request_rejected_response();
+                }
+                let controller = self
+                    .scenario_controller
+                    .as_mut()
+                    .expect("scenario controller availability was checked");
                 match controller.prepare_clear(target, request.actor_label, Instant::now()) {
                     Ok(snapshot) => {
                         self.log_scenario_action("clear", actor_label.as_deref(), &snapshot);
+                        management_response_or_internal(management::json_success(
+                            management::StatusCode::Accepted,
+                            &snapshot,
+                        ))
+                    }
+                    Err(_) => scenario_request_rejected_response(),
+                }
+            }
+            management::ManagementRequest::Cancel(request) => {
+                let Some(token) = ActivationToken::from_value(request.token) else {
+                    return management_error_response(
+                        management::StatusCode::BadRequest,
+                        "invalid_token",
+                        "token must be greater than zero",
+                    );
+                };
+                let Some(controller) = self.scenario_controller.as_mut() else {
+                    return scenario_controller_unavailable_response();
+                };
+                if crate::scenario::validate_actor_label(request.actor_label.as_deref()).is_err() {
+                    return scenario_request_rejected_response();
+                }
+                match controller.cancel(token, Instant::now()) {
+                    Ok(snapshot) => {
+                        self.log_scenario_action("cancel", request.actor_label.as_deref(), &snapshot);
                         management_response_or_internal(management::json_success(
                             management::StatusCode::Accepted,
                             &snapshot,
@@ -938,43 +1078,178 @@ impl Server {
         ))
     }
 
-    fn management_state_response(&mut self) -> Vec<u8> {
-        let endpoints = self
-            .endpoints
+    fn management_catalog_response(&self) -> Vec<u8> {
+        let Some(catalog) = self
+            .scenario_controller
+            .as_ref()
+            .map(ScenarioController::catalog)
+        else {
+            return scenario_controller_unavailable_response();
+        };
+        let scenarios = catalog
+            .scenarios()
             .iter()
-            .map(|endpoint| ManagementEndpointState {
-                stream_id: endpoint.descriptor.stream_id,
-                active_connections: endpoint
-                    .connections
-                    .iter()
-                    .filter(|connection| connection.is_some())
-                    .count(),
-                connections: endpoint
-                    .connections
-                    .iter()
-                    .filter_map(|connection| connection.as_ref())
-                    .map(|connection| ManagementPdcState {
-                        connection_id: connection.connection_id.0,
-                        streaming: connection.streaming,
-                    })
-                    .collect(),
+            .enumerate()
+            .map(|(index, scenario)| ManagementCatalogScenario {
+                index,
+                name: scenario.name.clone(),
+                kind: scenario.kind,
+                target_compatibility: management_target_compatibility(scenario.kind),
+                lifecycle: scenario.lifecycle,
+                start_frame_offset: scenario.start_frame_offset,
+                duration_frames: scenario.duration_frames,
+                signal: scenario.signal,
             })
             .collect();
+        management_response_or_internal(management::json_success(
+            management::StatusCode::Ok,
+            &ManagementCatalogResponse {
+                version: catalog.version,
+                content_sha256: catalog.content_sha256(),
+                scenarios,
+            },
+        ))
+    }
+
+    fn management_state_response(&mut self) -> Vec<u8> {
         let scenario_controller = self
             .scenario_controller
             .as_mut()
             .map(|controller| controller.snapshot(Instant::now()));
-        management_response_or_internal(management::json_success(
+        let fleet = management_fleet_state(&self.endpoints);
+        let endpoints = management_endpoint_states(&self.endpoints);
+        match management::json_success(
             management::StatusCode::Ok,
             &ManagementStateResponse {
                 ready: self.ready,
                 time_health: self.time_health_state,
                 stats: self.stats,
+                fleet,
                 endpoints,
                 runtime_metadata: self.runtime_metadata.clone(),
                 scenario_controller,
             },
+        ) {
+            Ok(response) => response,
+            Err(management::ResponseEncodeError::BodyTooLarge { .. }) => {
+                management_error_response(
+                    management::StatusCode::NotAcceptable,
+                    "legacy_state_response_too_large",
+                    "legacy state response exceeds the 64 KiB limit; request GET /v1/state?format=console-v1 for the full lossless paged representation",
+                )
+            }
+            Err(error) => management_response_or_internal(Err(error)),
+        }
+    }
+
+    fn management_console_state_response(
+        &mut self,
+        cursor: Option<management::ConsoleStateCursor>,
+    ) -> Vec<u8> {
+        let (snapshot, controller_revision, catalog_content_sha256) = {
+            let Some(controller) = self.scenario_controller.as_mut() else {
+                return scenario_controller_unavailable_response();
+            };
+            let snapshot = controller.snapshot(Instant::now());
+            (
+                snapshot,
+                controller.revision(),
+                controller.catalog().content_sha256(),
+            )
+        };
+
+        let has_cursor = cursor.is_some();
+        let offset = match cursor {
+            Some(cursor)
+                if cursor.process_identity != self.console_process_identity
+                    || cursor.controller_revision != controller_revision =>
+            {
+                return management_error_response(
+                    management::StatusCode::BadRequest,
+                    "stale_console_cursor",
+                    "console state changed; reload is required",
+                )
+            }
+            Some(cursor) => cursor.offset,
+            None => 0,
+        };
+        let Some((scenario_controller, next_offset)) =
+            management_console_lifecycle_page(snapshot, offset)
+        else {
+            return management_error_response(
+                management::StatusCode::BadRequest,
+                "invalid_console_cursor",
+                "console cursor is outside the current state",
+            );
+        };
+        if has_cursor
+            && scenario_controller.prepared.is_empty()
+            && scenario_controller.pending.is_empty()
+            && scenario_controller.active.is_empty()
+        {
+            return management_error_response(
+                management::StatusCode::BadRequest,
+                "invalid_console_cursor",
+                "console cursor is outside the current state",
+            );
+        }
+        let next_cursor = next_offset.map(|next_offset| {
+            console_cursor(
+                &self.console_process_identity,
+                controller_revision,
+                next_offset,
+            )
+        });
+
+        management_response_or_internal(management::json_success(
+            management::StatusCode::Ok,
+            &ManagementConsoleStateResponse {
+                format: "console-v1",
+                process_identity: self.console_process_identity.clone(),
+                controller_revision,
+                catalog_content_sha256,
+                ready: self.ready,
+                time_health: self.time_health_state,
+                stats: self.stats,
+                fleet: management_fleet_state(&self.endpoints),
+                endpoints: management_endpoint_states(&self.endpoints),
+                runtime_metadata: self.runtime_metadata.clone(),
+                scenario_controller,
+                next_cursor,
+            },
         ))
+    }
+
+    fn scenario_target_is_admitted(
+        &self,
+        target: ScenarioTarget,
+        allows_disconnected_active_pdc: bool,
+    ) -> bool {
+        match target {
+            ScenarioTarget::Endpoint { stream_id } => self
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.descriptor.stream_id == stream_id),
+            ScenarioTarget::Pdc {
+                stream_id,
+                connection_id,
+            } => {
+                let is_live = self.endpoints.iter().any(|endpoint| {
+                    endpoint.descriptor.stream_id == stream_id
+                        && endpoint.connections.iter().any(|connection| {
+                            connection
+                                .as_ref()
+                                .is_some_and(|connection| connection.connection_id.0 == connection_id)
+                        })
+                });
+                is_live
+                    || (allows_disconnected_active_pdc
+                        && self
+                            .scenario_controller
+                            .as_ref()
+                            .is_some_and(|controller| controller.has_active_target(target)))
+            }
+        }
     }
 
     fn log_scenario_action<T: serde::Serialize>(
@@ -1001,6 +1276,200 @@ impl Server {
             eprintln!("{record}");
         }
     }
+}
+
+fn management_target_compatibility(kind: ScenarioKind) -> ManagementScenarioTargetCompatibility {
+    match kind {
+        ScenarioKind::DisconnectPdc => ManagementScenarioTargetCompatibility::Pdc,
+        ScenarioKind::Normal
+        | ScenarioKind::DegradedTime
+        | ScenarioKind::MissingFrames
+        | ScenarioKind::SignalExcursion
+        | ScenarioKind::Recovery => ManagementScenarioTargetCompatibility::Endpoint,
+    }
+}
+
+fn management_fleet_state(endpoints: &[Endpoint]) -> ManagementFleetState {
+    let descriptor = &endpoints
+        .first()
+        .expect("management state requires at least one endpoint")
+        .descriptor;
+    ManagementFleetState {
+        pdc_name: management_pdc_name(descriptor),
+        pmu_name_prefix: management_pmu_name_prefix(descriptor),
+        wire_version: descriptor.wire_version.protocol_version(),
+        reporting_rate_hz: descriptor.data_rate_hz,
+        nominal_frequency_hz: descriptor.nominal_frequency_hz,
+        first_stream_id: descriptor.stream_id,
+        first_pmu_id: descriptor.pmu_id,
+        first_port: descriptor.address.port(),
+    }
+}
+
+fn management_endpoint_states(endpoints: &[Endpoint]) -> Vec<ManagementEndpointState> {
+    endpoints
+        .iter()
+        .map(|endpoint| ManagementEndpointState {
+            stream_id: endpoint.descriptor.stream_id,
+            active_connections: endpoint
+                .connections
+                .iter()
+                .filter(|connection| connection.is_some())
+                .count(),
+            connections: endpoint
+                .connections
+                .iter()
+                .filter_map(|connection| connection.as_ref())
+                .map(|connection| ManagementPdcState {
+                    connection_id: connection.connection_id.0,
+                    streaming: connection.streaming,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn management_console_lifecycle_page(
+    snapshot: ScenarioControllerSnapshot,
+    offset: usize,
+) -> Option<(ManagementConsoleScenarioControllerState, Option<usize>)> {
+    let ScenarioControllerSnapshot {
+        current_sample_index,
+        prepared,
+        pending,
+        active,
+    } = snapshot;
+    let prepared_count = prepared.len();
+    let pending_count = pending.len();
+    let active_count = active.len();
+    let total_count = prepared_count
+        .checked_add(pending_count)?
+        .checked_add(active_count)?;
+    if offset > total_count {
+        return None;
+    }
+
+    let prepared_offset = offset.min(prepared_count);
+    let prepared = prepared
+        .into_iter()
+        .skip(prepared_offset)
+        .take(CONSOLE_LIFECYCLE_RECORDS_PER_PAGE)
+        .collect::<Vec<_>>();
+    let remaining = CONSOLE_LIFECYCLE_RECORDS_PER_PAGE - prepared.len();
+
+    let pending_offset = offset.saturating_sub(prepared_count).min(pending_count);
+    let pending = pending
+        .into_iter()
+        .skip(pending_offset)
+        .take(remaining)
+        .collect::<Vec<_>>();
+    let remaining = remaining - pending.len();
+
+    let active_offset = offset
+        .saturating_sub(prepared_count.saturating_add(pending_count))
+        .min(active_count);
+    let active = active
+        .into_iter()
+        .skip(active_offset)
+        .take(remaining)
+        .collect::<Vec<_>>();
+    let page_record_count = prepared.len() + pending.len() + active.len();
+    let next_offset = (offset + page_record_count < total_count).then_some(offset + page_record_count);
+
+    Some((
+        ManagementConsoleScenarioControllerState {
+            current_sample_index,
+            prepared,
+            pending,
+            active,
+            prepared_count,
+            pending_count,
+            active_count,
+        },
+        next_offset,
+    ))
+}
+
+fn console_cursor(process_identity: &str, controller_revision: u64, offset: usize) -> String {
+    format!("{process_identity}:{controller_revision}:{offset}")
+}
+
+fn management_pdc_name(descriptor: &EndpointDescriptor) -> String {
+    if descriptor.pdc_name.is_empty() {
+        return String::new();
+    }
+    management_indexed_name(&descriptor.pdc_name)
+}
+
+fn management_pmu_name(descriptor: &EndpointDescriptor) -> String {
+    match descriptor.wire_version {
+        WireVersion::V2 => {
+            let metadata = descriptor
+                .v2
+                .as_ref()
+                .expect("V2 descriptor requires V2 metadata");
+            std::str::from_utf8(&metadata.station_name)
+                .expect("V2 station name is validated printable ASCII")
+                .trim_end_matches(' ')
+                .to_owned()
+        }
+        WireVersion::V3 => management_indexed_name(&descriptor.pmu_name),
+    }
+}
+
+fn management_pmu_name_prefix(descriptor: &EndpointDescriptor) -> String {
+    management_pmu_name_parts(descriptor).0
+}
+
+fn management_pmu_name_parts(descriptor: &EndpointDescriptor) -> (String, String) {
+    let name = management_pmu_name(descriptor);
+    let split_at = name
+        .len()
+        .checked_sub(3)
+        .expect("compiled PMU names must end in a three-digit ordinal");
+    let (prefix, suffix) = name.split_at(split_at);
+    assert!(
+        suffix.bytes().all(|byte| byte.is_ascii_digit()),
+        "compiled PMU names must end in a three-digit ordinal"
+    );
+    (prefix.to_owned(), suffix.to_owned())
+}
+
+fn management_indexed_name(encoded: &[u8]) -> String {
+    let (length, value) = encoded
+        .split_first()
+        .expect("V3 descriptor requires an indexed name");
+    let value = &value[..usize::from(*length)];
+    std::str::from_utf8(value)
+        .expect("V3 names are validated UTF-8")
+        .to_owned()
+}
+
+fn new_console_process_identity() -> String {
+    let sequence = NEXT_CONSOLE_PROCESS_INCARNATION.fetch_add(1, Ordering::Relaxed);
+    let started_unix_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    sha256_hex(
+        format!(
+            "{}:{started_unix_nanos}:{sequence}",
+            std::process::id(),
+        )
+        .as_bytes(),
+    )
+}
+
+fn valid_runtime_text(value: &str, maximum_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum_bytes
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == SHA256_HEX_BYTES
+        && value.bytes().all(|byte| {
+            byte.is_ascii_digit() || (byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())
+        })
 }
 
 fn prometheus_label(value: &str) -> String {
@@ -2197,7 +2666,12 @@ mod tests {
 
     use crate::{
         config::{parse_profile, WireVersion},
-        scenario::{parse_catalog, ScenarioCatalog, ScenarioTarget},
+        identity::RuntimeIdentity,
+        management::MAX_RESPONSE_BODY_BYTES,
+        scenario::{
+            parse_catalog, ScenarioCatalog, ScenarioTarget, MAX_SCENARIO_CATALOG_ENTRIES,
+            MAX_SCENARIO_ACTOR_LABEL_BYTES, MAX_SCENARIO_TARGETS,
+        },
         time_health::{TimeHealthState, TimeSynchronizationSource},
         wire_v2,
         wire_v3::{
@@ -2208,8 +2682,9 @@ mod tests {
 
     use super::{
         aligned_timestamp, BufferedCommandRequest, ManagementConfig, PendingFrame, ReceiveBuffer,
-        ReceivedCommand, Server, ServerCommand, WallClock, FIRST_VALID_COMMAND_DEADLINE,
-        IDLE_NON_STREAMING_DEADLINE,
+        ReceivedCommand, Server, ServerCommand, WallClock, CONSOLE_LIFECYCLE_RECORDS_PER_PAGE,
+        FIRST_VALID_COMMAND_DEADLINE, IDLE_NON_STREAMING_DEADLINE, MAX_RUNTIME_DEPLOYMENT_LABEL_BYTES,
+        MAX_RUNTIME_IMAGE_REFERENCE_BYTES,
     };
 
     fn profile(port: u16) -> String {
@@ -2238,6 +2713,1183 @@ mod tests {
     fn baseline_catalog() -> ScenarioCatalog {
         parse_catalog(include_str!("../scenarios/baseline.yaml"))
             .expect("baseline scenario catalog must compile")
+    }
+
+    fn maximum_occupancy_catalog() -> ScenarioCatalog {
+        parse_catalog(
+            "version: 1\nscenarios:\n  - name: normal\n    kind: normal\n    start_frame_offset: 0\n    lifecycle: sustained\n  - name: degraded-time\n    kind: degraded_time\n    start_frame_offset: 0\n    lifecycle: sustained\n  - name: missing-frames\n    kind: missing_frames\n    start_frame_offset: 0\n    lifecycle: sustained\n  - name: disconnect-pdc\n    kind: disconnect_pdc\n    start_frame_offset: 0\n    lifecycle: sustained\n",
+        )
+        .expect("maximum-occupancy scenario catalog must compile")
+    }
+
+    fn json_escape_expanding_text(byte_count: usize) -> String {
+        (0..byte_count)
+            .map(|index| if index % 2 == 0 { '"' } else { '\\' })
+            .collect()
+    }
+
+    fn yaml_quoted(value: &str) -> String {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+
+    fn maximum_payload_profile(first_port: u16, pdc_name: &str, pmu_name_prefix: &str) -> String {
+        include_str!("../profiles/one-hundred-fifty-pmu.yaml")
+            .replace("bind_address: 0.0.0.0", "bind_address: 127.0.0.1")
+            .replace(
+                "first_listen_port: 4712",
+                &format!("first_listen_port: {first_port}"),
+            )
+            .replace("pdc_name: WAMA", &format!("pdc_name: {}", yaml_quoted(pdc_name)))
+            .replace(
+                "pmu_name_prefix: WAMA-PMU-",
+                &format!("pmu_name_prefix: {}", yaml_quoted(pmu_name_prefix)),
+            )
+    }
+
+    fn maximum_management_catalog() -> ScenarioCatalog {
+        let mut source = String::from("version: 1\nscenarios:\n");
+        for index in 0..MAX_SCENARIO_CATALOG_ENTRIES {
+            source.push_str(&format!(
+                "  - name: scenario-{index:03}-{}\n    kind: signal_excursion\n    start_frame_offset: 18446744073709551615\n    lifecycle: transient\n    duration_frames: 18446744073709551615\n    signal:\n      voltage_magnitude_delta: 1.0\n      frequency_deviation_hz: 1.0\n      rocof_hz_per_s: 1.0\n",
+                "x".repeat(51)
+            ));
+        }
+        parse_catalog(&source).expect("maximum management catalog must compile")
+    }
+
+    fn loopback_port_range(count: u16) -> u16 {
+        for first_port in (20_000..=u16::MAX - count + 1).step_by(257) {
+            let listeners = (0..count)
+                .map(|offset| StdTcpListener::bind(("127.0.0.1", first_port + offset)))
+                .collect::<Result<Vec<_>, _>>();
+            if let Ok(listeners) = listeners {
+                drop(listeners);
+                return first_port;
+            }
+        }
+        panic!("cannot reserve a loopback port range for the 150-PMU profile");
+    }
+
+    fn catalog_scenario<'a>(catalog: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+        catalog["scenarios"]
+            .as_array()
+            .expect("catalog scenarios must be an array")
+            .iter()
+            .find(|scenario| scenario["name"].as_str() == Some(name))
+            .expect("catalog must contain the expected scenario")
+    }
+
+    fn console_cursor_from_value(value: &serde_json::Value) -> crate::management::ConsoleStateCursor {
+        let cursor = value["next_cursor"]
+            .as_str()
+            .expect("a non-final console page must provide a cursor");
+        let mut parts = cursor.split(':');
+        let process_identity = parts.next().expect("cursor identity").to_owned();
+        let controller_revision = parts
+            .next()
+            .expect("cursor revision")
+            .parse()
+            .expect("cursor revision is decimal");
+        let offset = parts
+            .next()
+            .expect("cursor offset")
+            .parse()
+            .expect("cursor offset is decimal");
+        assert!(parts.next().is_none(), "cursor has exactly three parts");
+        crate::management::ConsoleStateCursor {
+            process_identity,
+            controller_revision,
+            offset,
+        }
+    }
+
+    #[test]
+    fn management_catalog_response_bounds_the_largest_admitted_catalog() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("reserve a local port");
+        let port = listener.local_addr().expect("discover local port").port();
+        drop(listener);
+
+        let profile = parse_profile(&profile(port)).expect("profile must compile");
+        let mut server = Server::bind_with_management(
+            profile,
+            maximum_management_catalog(),
+            TimeSynchronizationSource::AlwaysVerified,
+            ManagementConfig {
+                bind_address: "127.0.0.1:0".parse().expect("parse management address"),
+            },
+        )
+        .expect("management-enabled server must bind");
+
+        let response = server.management_catalog_response();
+        assert_http_status(&response, "HTTP/1.1 200 OK");
+        assert!(
+            response_body(&response).len() <= MAX_RESPONSE_BODY_BYTES,
+            "largest admitted catalog must fit the 64 KiB response limit"
+        );
+        let catalog: serde_json::Value = serde_json::from_slice(response_body(&response))
+            .expect("catalog response must be JSON");
+        assert_eq!(
+            catalog["scenarios"].as_array().map(Vec::len),
+            Some(MAX_SCENARIO_CATALOG_ENTRIES)
+        );
+        assert!(catalog["content_sha256"].is_string());
+
+        let console = server.management_console_state_response(None);
+        assert_http_status(&console, "HTTP/1.1 200 OK");
+        assert!(
+            response_body(&console).len() <= MAX_RESPONSE_BODY_BYTES,
+            "largest admitted catalog must not make console state exceed the 64 KiB response limit"
+        );
+        let console: serde_json::Value = serde_json::from_slice(response_body(&console))
+            .expect("console response must be JSON");
+        assert_eq!(console["catalog_content_sha256"], catalog["content_sha256"]);
+    }
+
+    #[test]
+    fn management_loopback_serves_catalog_and_browser_ready_state() {
+        const PMU_COUNT: u16 = 150;
+
+        let first_port = loopback_port_range(PMU_COUNT);
+        let profile_source = include_str!("../profiles/one-hundred-fifty-pmu.yaml")
+            .replace("bind_address: 0.0.0.0", "bind_address: 127.0.0.1")
+            .replace(
+                "first_listen_port: 4712",
+                &format!("first_listen_port: {first_port}"),
+            );
+        let profile = parse_profile(&profile_source).expect("150-PMU profile must compile");
+        let server = Server::bind_with_management(
+            profile,
+            baseline_catalog(),
+            TimeSynchronizationSource::AlwaysVerified,
+            ManagementConfig {
+                bind_address: "127.0.0.1:0".parse().expect("parse management address"),
+            },
+        )
+        .expect("management-enabled 150-PMU server must bind");
+        let management_address = server
+            .management_address()
+            .expect("management listener must expose its bound address");
+        let handle = thread::spawn(move || {
+            let mut server = server;
+            server
+                .run_for(Duration::from_secs(3))
+                .expect("server must run")
+        });
+
+        let catalog_response = management_get(management_address, "/v1/catalog");
+        assert_http_status(&catalog_response, "HTTP/1.1 200 OK");
+        assert!(
+            response_body(&catalog_response).len() <= MAX_RESPONSE_BODY_BYTES,
+            "catalog response exceeds the 64 KiB body limit"
+        );
+        let catalog: serde_json::Value = serde_json::from_slice(response_body(&catalog_response))
+            .expect("catalog response must be JSON");
+        assert_eq!(catalog["version"].as_u64(), Some(1));
+        assert!(catalog["content_sha256"].is_string());
+        assert_eq!(
+            catalog["scenarios"].as_array().map(Vec::len),
+            Some(baseline_catalog().scenarios().len())
+        );
+        assert_eq!(
+            catalog_scenario(&catalog, "disconnect-pdc")["kind"].as_str(),
+            Some("disconnect_pdc")
+        );
+        assert_eq!(
+            catalog_scenario(&catalog, "disconnect-pdc")["index"].as_u64(),
+            Some(3)
+        );
+        assert_eq!(
+            catalog_scenario(&catalog, "disconnect-pdc")["target_compatibility"].as_str(),
+            Some("pdc")
+        );
+        for name in ["degraded-time", "missing-frames", "signal-excursion"] {
+            assert_eq!(
+                catalog_scenario(&catalog, name)["target_compatibility"].as_str(),
+                Some("endpoint"),
+                "{name} must be endpoint-compatible"
+            );
+        }
+        assert!(catalog_scenario(&catalog, "normal").is_object());
+        assert!(catalog_scenario(&catalog, "recovery").is_object());
+        assert_eq!(
+            catalog_scenario(&catalog, "signal-excursion")["signal"]
+                ["frequency_deviation_hz"]
+                .as_f64(),
+            Some(0.5)
+        );
+
+        let catalog_again = management_get(management_address, "/v1/catalog");
+        assert_http_status(&catalog_again, "HTTP/1.1 200 OK");
+        let catalog_again: serde_json::Value = serde_json::from_slice(response_body(&catalog_again))
+            .expect("repeated catalog response must be JSON");
+        assert_eq!(catalog_again, catalog, "catalog identity must remain immutable");
+
+        let state_response = management_get(management_address, "/v1/state");
+        assert_http_status(&state_response, "HTTP/1.1 200 OK");
+        assert!(
+            response_body(&state_response).len() <= MAX_RESPONSE_BODY_BYTES,
+            "state response exceeds the 64 KiB body limit"
+        );
+        let state: serde_json::Value = serde_json::from_slice(response_body(&state_response))
+            .expect("state response must be JSON");
+        assert_eq!(state["ready"].as_bool(), Some(true));
+        assert!(state["time_health"].is_string());
+        assert!(state["stats"].is_object());
+        assert!(state["scenario_controller"].is_object());
+        assert!(state["scenario_controller"].get("current_sample_index").is_some());
+        for field in ["prepared", "pending", "active"] {
+            assert_eq!(
+                state["scenario_controller"][field].as_array().map(Vec::len),
+                Some(0),
+                "empty controller must expose an empty {field} collection"
+            );
+        }
+        assert!(state["scenario_controller"].get("targets").is_none());
+        assert!(state["scenario_controller"].get("format").is_none());
+        let fleet = &state["fleet"];
+        assert!(fleet["pdc_name"].is_string());
+        assert!(fleet["pmu_name_prefix"].is_string());
+        assert_eq!(fleet["pdc_name"].as_str(), Some("WAMA"));
+        assert_eq!(fleet["pmu_name_prefix"].as_str(), Some("WAMA-PMU-"));
+        assert_eq!(fleet["wire_version"].as_u64(), Some(3));
+        assert_eq!(fleet["reporting_rate_hz"].as_u64(), Some(50));
+        assert_eq!(fleet["nominal_frequency_hz"].as_u64(), Some(50));
+        assert_eq!(fleet["first_stream_id"].as_u64(), Some(1001));
+        assert_eq!(fleet["first_pmu_id"].as_u64(), Some(1001));
+        assert_eq!(fleet["first_port"].as_u64(), Some(u64::from(first_port)));
+        let endpoints = state["endpoints"]
+            .as_array()
+            .expect("state endpoints must be an array");
+        assert_eq!(endpoints.len(), usize::from(PMU_COUNT));
+        let endpoint = endpoints
+            .iter()
+            .find(|endpoint| endpoint["stream_id"].as_u64() == Some(1001))
+            .expect("first PMU endpoint must be present");
+        assert_eq!(endpoint["active_connections"].as_u64(), Some(0));
+        assert_eq!(endpoint["connections"].as_array().map(Vec::len), Some(0));
+        let endpoint_offset = endpoint["stream_id"]
+            .as_u64()
+            .expect("endpoint stream ID must be numeric")
+            - fleet["first_stream_id"]
+                .as_u64()
+                .expect("fleet first stream ID must be numeric");
+        assert_eq!(
+            fleet["first_pmu_id"].as_u64().expect("fleet PMU ID must be numeric")
+                + endpoint_offset,
+            1001
+        );
+        assert_eq!(
+            fleet["first_port"].as_u64().expect("fleet port must be numeric") + endpoint_offset,
+            u64::from(first_port)
+        );
+        assert_eq!(
+            format!(
+                "{}{:03}",
+                fleet["pmu_name_prefix"]
+                    .as_str()
+                    .expect("fleet PMU name prefix must be text"),
+                endpoint_offset + 1,
+            ),
+            "WAMA-PMU-001"
+        );
+
+        let console_response = management_get(management_address, "/v1/state?format=console-v1");
+        assert_http_status(&console_response, "HTTP/1.1 200 OK");
+        let console: serde_json::Value = serde_json::from_slice(response_body(&console_response))
+            .expect("console response must be JSON");
+        assert_eq!(console["format"].as_str(), Some("console-v1"));
+        assert_eq!(console["catalog_content_sha256"], catalog["content_sha256"]);
+        assert!(console["process_identity"].is_string());
+        assert!(console["controller_revision"].is_u64());
+
+        let _ = handle.join().expect("server thread must finish");
+    }
+
+    #[test]
+    fn maximum_state_returns_bounded_legacy_outcome_and_lossless_console_pages() {
+        const PMU_COUNT: u16 = 150;
+
+        let first_port = loopback_port_range(PMU_COUNT);
+        let pdc_name = json_escape_expanding_text(usize::from(u8::MAX));
+        let pmu_name_prefix = json_escape_expanding_text(usize::from(u8::MAX) - 3);
+        assert_eq!(pdc_name.len(), usize::from(u8::MAX));
+        assert_eq!(pmu_name_prefix.len(), usize::from(u8::MAX) - 3);
+        let profile_source = maximum_payload_profile(first_port, &pdc_name, &pmu_name_prefix);
+        let profile = parse_profile(&profile_source).expect("150-PMU profile must compile");
+        let mut server = Server::bind_with_management(
+            profile,
+            maximum_occupancy_catalog(),
+            TimeSynchronizationSource::AlwaysVerified,
+            ManagementConfig {
+                bind_address: "127.0.0.1:0".parse().expect("parse management address"),
+            },
+        )
+        .expect("management-enabled 150-PMU server must bind");
+        let mut clients = Vec::with_capacity(usize::from(PMU_COUNT) * 2);
+        for port_offset in 0..PMU_COUNT {
+            let port = first_port + port_offset;
+            clients.push(connect(port));
+            clients.push(connect(port));
+        }
+        pump_until(&mut server, |server| {
+            server.endpoints.iter().all(|endpoint| {
+                endpoint
+                    .connections
+                    .iter()
+                    .all(Option::is_some)
+            })
+        });
+            let deployment_label = json_escape_expanding_text(MAX_RUNTIME_DEPLOYMENT_LABEL_BYTES);
+            let image_ref = json_escape_expanding_text(MAX_RUNTIME_IMAGE_REFERENCE_BYTES);
+        assert_eq!(deployment_label.len(), MAX_RUNTIME_DEPLOYMENT_LABEL_BYTES);
+        assert_eq!(image_ref.len(), MAX_RUNTIME_IMAGE_REFERENCE_BYTES);
+            assert!(server.configure_runtime_metadata(
+                deployment_label.clone(),
+                RuntimeIdentity::new(image_ref.clone(), b"profile", b"catalog"),
+            ));
+
+            let ordinary_state = server.management_state_response();
+            assert_http_status(&ordinary_state, "HTTP/1.1 200 OK");
+            assert!(
+                response_body(&ordinary_state).len() <= MAX_RESPONSE_BODY_BYTES,
+                "ordinary legacy state must remain bounded"
+            );
+            let ordinary_state: serde_json::Value = serde_json::from_slice(response_body(&ordinary_state))
+                .expect("ordinary state response must be JSON");
+            assert_eq!(ordinary_state["ready"].as_bool(), Some(true));
+            assert!(ordinary_state["time_health"].is_string());
+            assert!(ordinary_state["stats"].is_object());
+            assert!(ordinary_state["fleet"]["pdc_name"].is_string());
+            assert!(ordinary_state["fleet"]["pmu_name_prefix"].is_string());
+            assert_eq!(ordinary_state["fleet"]["pdc_name"].as_str(), Some(pdc_name.as_str()));
+            assert_eq!(
+                ordinary_state["fleet"]["pmu_name_prefix"].as_str(),
+                Some(pmu_name_prefix.as_str())
+            );
+            assert_eq!(
+                ordinary_state["endpoints"].as_array().map(Vec::len),
+                Some(usize::from(PMU_COUNT))
+            );
+            let ordinary_live_pdc_records: usize = ordinary_state["endpoints"]
+                .as_array()
+                .expect("ordinary state endpoints")
+                .iter()
+                .map(|endpoint| {
+                    endpoint["connections"]
+                        .as_array()
+                        .expect("ordinary state endpoint connections")
+                        .len()
+                })
+                .sum();
+            assert_eq!(ordinary_live_pdc_records, 300);
+            assert_eq!(
+                ordinary_state["scenario_controller"]["prepared"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(0)
+            );
+            assert_eq!(
+                ordinary_state["scenario_controller"]["pending"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(0)
+            );
+            assert_eq!(
+                ordinary_state["scenario_controller"]["active"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(0)
+            );
+            assert_eq!(
+                ordinary_state["runtime_metadata"]["deployment_label"].as_str(),
+                Some(deployment_label.as_str())
+            );
+            assert_eq!(
+                ordinary_state["runtime_metadata"]["runtime_identity"]["image_ref"].as_str(),
+                Some(image_ref.as_str())
+            );
+
+        let endpoint_targets: Vec<_> = server
+            .endpoints
+            .iter()
+            .map(|endpoint| ScenarioTarget::Endpoint {
+                stream_id: endpoint.descriptor.stream_id,
+            })
+            .collect();
+        let pdc_targets: Vec<_> = server
+            .endpoints
+            .iter()
+            .flat_map(|endpoint| {
+                endpoint.connections.iter().filter_map(|connection| {
+                    connection.as_ref().map(|connection| ScenarioTarget::Pdc {
+                        stream_id: endpoint.descriptor.stream_id,
+                        connection_id: connection.connection_id.0,
+                    })
+                })
+            })
+            .collect();
+        assert_eq!(endpoint_targets.len(), usize::from(PMU_COUNT));
+        assert_eq!(pdc_targets.len(), usize::from(PMU_COUNT) * 2);
+        assert_eq!(
+            endpoint_targets.len() + pdc_targets.len(),
+            MAX_SCENARIO_TARGETS
+        );
+
+        let now = Instant::now();
+        let actor_label = json_escape_expanding_text(MAX_SCENARIO_ACTOR_LABEL_BYTES);
+        let maximum_target_count =
+            u64::try_from(MAX_SCENARIO_TARGETS).expect("target capacity must fit in u64");
+        assert_eq!(actor_label.len(), MAX_SCENARIO_ACTOR_LABEL_BYTES);
+        {
+            let controller = server
+                .scenario_controller_mut()
+                .expect("server must own a scenario controller");
+            for target in endpoint_targets.iter().copied() {
+                let prepared = controller
+                    .prepare_activation(target, "normal", Some(actor_label.clone()), now)
+                    .expect("endpoint activation must prepare");
+                controller
+                    .confirm(prepared.token, now)
+                    .expect("endpoint activation must confirm");
+            }
+            for target in pdc_targets.iter().copied() {
+                let prepared = controller
+                    .prepare_activation(
+                        target,
+                        "disconnect-pdc",
+                        Some(actor_label.clone()),
+                        now,
+                    )
+                    .expect("PDC activation must prepare");
+                controller
+                    .confirm(prepared.token, now)
+                    .expect("PDC activation must confirm");
+            }
+            controller
+                .advance_boundary(0)
+                .expect("all confirmed actions activate together");
+            for target in endpoint_targets
+                .iter()
+                .copied()
+                .chain(pdc_targets.iter().copied())
+            {
+                controller
+                    .prepare_clear(target, Some(actor_label.clone()), now)
+                    .expect("every sustained action must permit a prepared clear");
+            }
+        }
+
+        let disconnected_target = pdc_targets[0];
+        let disconnected_connection_id = match disconnected_target {
+            ScenarioTarget::Pdc { connection_id, .. } => connection_id,
+            ScenarioTarget::Endpoint { .. } => unreachable!("PDC target is required"),
+        };
+        drop(
+            server.endpoints[0].connections[0]
+                .take()
+                .expect("first PDC must be connected"),
+        );
+        clients.push(connect(first_port));
+        pump_until(&mut server, |server| {
+            server.endpoints.iter().all(|endpoint| {
+                endpoint
+                    .connections
+                    .iter()
+                    .all(Option::is_some)
+            })
+        });
+
+        let expected_snapshot = server
+            .scenario_controller_mut()
+            .expect("server must own a scenario controller")
+            .snapshot(Instant::now());
+        let mut expected_prepared = serde_json::to_value(&expected_snapshot.prepared)
+            .expect("prepared records serialize");
+        for record in expected_prepared
+            .as_array_mut()
+            .expect("prepared records are an array")
+        {
+            record
+                .as_object_mut()
+                .expect("prepared record is an object")
+                .remove("confirm_expires_in_ms");
+        }
+        let expected_pending = serde_json::to_value(&expected_snapshot.pending)
+            .expect("pending records serialize");
+        let expected_active = serde_json::to_value(&expected_snapshot.active)
+            .expect("active records serialize");
+
+        let overflow = server.management_state_response();
+        assert_http_status(&overflow, "HTTP/1.1 406 Not Acceptable");
+        assert!(
+            response_body(&overflow).len() < 512,
+            "legacy overflow response must remain small"
+        );
+        let overflow: serde_json::Value = serde_json::from_slice(response_body(&overflow))
+            .expect("legacy overflow response must be JSON");
+        assert_eq!(
+            overflow["error"]["code"].as_str(),
+            Some("legacy_state_response_too_large")
+        );
+        assert_eq!(
+            overflow["error"]["message"].as_str(),
+            Some("legacy state response exceeds the 64 KiB limit; request GET /v1/state?format=console-v1 for the full lossless paged representation")
+        );
+
+        let mut cursor = None;
+        let mut page_count = 0;
+        let mut prepared_records = Vec::new();
+        let mut pending_records = Vec::new();
+        let mut active_records = Vec::new();
+        let mut first_page = None;
+        loop {
+            let response = server.management_console_state_response(cursor.take());
+            assert_http_status(&response, "HTTP/1.1 200 OK");
+            assert!(
+                response_body(&response).len() <= MAX_RESPONSE_BODY_BYTES,
+                "every console page must fit the 64 KiB body limit"
+            );
+            let page: serde_json::Value = serde_json::from_slice(response_body(&response))
+                .expect("console response must be JSON");
+            page_count += 1;
+            assert_eq!(page["format"].as_str(), Some("console-v1"));
+            let controller = &page["scenario_controller"];
+            assert_eq!(controller["prepared_count"].as_u64(), Some(maximum_target_count));
+            assert_eq!(controller["pending_count"].as_u64(), Some(0));
+            assert_eq!(controller["active_count"].as_u64(), Some(maximum_target_count));
+            for record in controller["prepared"]
+                .as_array()
+                .expect("prepared page records")
+            {
+                assert!(record["token"].as_str().is_some());
+                assert!(record["confirm_expires_in_ms"].as_u64().is_some());
+            }
+            let page_records = controller["prepared"]
+                .as_array()
+                .expect("prepared page records")
+                .len()
+                + controller["pending"]
+                    .as_array()
+                    .expect("pending page records")
+                    .len()
+                + controller["active"]
+                    .as_array()
+                    .expect("active page records")
+                    .len();
+            assert!(page_records <= CONSOLE_LIFECYCLE_RECORDS_PER_PAGE);
+            prepared_records.extend(
+                controller["prepared"]
+                    .as_array()
+                    .expect("prepared page records")
+                    .iter()
+                    .cloned(),
+            );
+            pending_records.extend(
+                controller["pending"]
+                    .as_array()
+                    .expect("pending page records")
+                    .iter()
+                    .cloned(),
+            );
+            active_records.extend(
+                controller["active"]
+                    .as_array()
+                    .expect("active page records")
+                    .iter()
+                    .cloned(),
+            );
+            if first_page.is_none() {
+                first_page = Some(page.clone());
+            }
+            cursor = page["next_cursor"]
+                .as_str()
+                .map(|_| console_cursor_from_value(&page));
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        assert!(page_count > 1, "the maximum lifecycle state must be paged");
+        for record in &mut prepared_records {
+            record
+                .as_object_mut()
+                .expect("prepared record is an object")
+                .remove("confirm_expires_in_ms");
+        }
+        assert_eq!(serde_json::Value::Array(prepared_records), expected_prepared);
+        assert_eq!(serde_json::Value::Array(pending_records), expected_pending);
+        assert_eq!(serde_json::Value::Array(active_records), expected_active);
+
+        let first_page = first_page.expect("first console page");
+        let live_pdc_records: usize = first_page["endpoints"]
+            .as_array()
+            .expect("console endpoints")
+            .iter()
+            .map(|endpoint| {
+                endpoint["connections"]
+                    .as_array()
+                    .expect("console endpoint connections")
+                    .len()
+            })
+            .sum();
+        assert_eq!(live_pdc_records, 300);
+        assert!(first_page["fleet"]["pdc_name"].is_string());
+        assert!(first_page["fleet"]["pmu_name_prefix"].is_string());
+        assert_eq!(first_page["fleet"]["pdc_name"].as_str(), Some(pdc_name.as_str()));
+        assert_eq!(
+            first_page["fleet"]["pmu_name_prefix"].as_str(),
+            Some(pmu_name_prefix.as_str())
+        );
+        assert_eq!(
+            first_page["runtime_metadata"]["deployment_label"].as_str(),
+            Some(deployment_label.as_str())
+        );
+        assert_eq!(
+            first_page["runtime_metadata"]["runtime_identity"]["image_ref"].as_str(),
+            Some(image_ref.as_str())
+        );
+        let disconnected_active = expected_active
+            .as_array()
+            .expect("expected active records")
+            .iter()
+            .find(|record| {
+                record["target"]["pdc"]["connection_id"].as_u64()
+                    == Some(disconnected_connection_id)
+            })
+            .expect("disconnected PDC target remains active");
+        assert_eq!(
+            disconnected_active["actor_label"].as_str(),
+            Some(actor_label.as_str())
+        );
+        assert!(
+            first_page["endpoints"]
+                .as_array()
+                .expect("console endpoints")
+                .iter()
+                .all(|endpoint| {
+                    endpoint["connections"]
+                        .as_array()
+                        .expect("console endpoint connections")
+                        .iter()
+                        .all(|connection| {
+                            connection["connection_id"].as_u64()
+                                != Some(disconnected_connection_id)
+                        })
+                }),
+            "the old disconnected PDC ID must not be reported as live"
+        );
+        assert!(
+            expected_prepared
+                .as_array()
+                .expect("expected prepared records")
+                .iter()
+                .any(|record| {
+                    record["target"]["pdc"]["connection_id"].as_u64()
+                        == Some(disconnected_connection_id)
+                        && record["actor_label"].as_str()
+                            == Some(actor_label.as_str())
+                }),
+            "prepared clears retain exact actor labels for disconnected active PDCs"
+        );
+
+        drop(clients);
+    }
+
+    #[test]
+    fn management_state_preserves_prepared_pending_and_active_scenario_detail() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("reserve a local port");
+        let port = listener.local_addr().expect("discover local port").port();
+        drop(listener);
+
+        let profile = parse_profile(&two_endpoint_profile(port)).expect("profile must compile");
+        let mut server = Server::bind_with_management(
+            profile,
+            baseline_catalog(),
+            TimeSynchronizationSource::AlwaysVerified,
+            ManagementConfig {
+                bind_address: "127.0.0.1:0".parse().expect("parse management address"),
+            },
+        )
+        .expect("management-enabled server must bind");
+        let now = Instant::now();
+        let active = server
+            .scenario_controller_mut()
+            .expect("server must own a scenario controller")
+            .prepare_activation(
+                ScenarioTarget::Endpoint { stream_id: 1001 },
+                "degraded-time",
+                Some("active operator".to_owned()),
+                now,
+            )
+            .expect("active scenario must prepare");
+        server
+            .scenario_controller_mut()
+            .expect("server must own a scenario controller")
+            .confirm(active.token, now)
+            .expect("active scenario must confirm");
+        emit_boundary(&mut server, 0);
+
+        let prepared = server
+            .scenario_controller_mut()
+            .expect("server must own a scenario controller")
+            .prepare_activation(
+                ScenarioTarget::Endpoint { stream_id: 1002 },
+                "missing-frames",
+                Some("prepared operator".to_owned()),
+                now,
+            )
+            .expect("prepared scenario must prepare");
+        let pending = server
+            .scenario_controller_mut()
+            .expect("server must own a scenario controller")
+            .prepare_activation(
+                ScenarioTarget::Pdc {
+                    stream_id: 1001,
+                    connection_id: 9,
+                },
+                "disconnect-pdc",
+                Some("pending operator".to_owned()),
+                now,
+            )
+            .expect("pending scenario must prepare");
+        server
+            .scenario_controller_mut()
+            .expect("server must own a scenario controller")
+            .confirm(pending.token, now)
+            .expect("pending scenario must confirm");
+
+        let response = server.management_state_response();
+        assert_http_status(&response, "HTTP/1.1 200 OK");
+        let state: serde_json::Value = serde_json::from_slice(response_body(&response))
+            .expect("state response must be JSON");
+        let controller = &state["scenario_controller"];
+        assert_eq!(controller["prepared"].as_array().map(Vec::len), Some(1));
+        assert_eq!(controller["pending"].as_array().map(Vec::len), Some(1));
+        assert_eq!(controller["active"].as_array().map(Vec::len), Some(1));
+
+        let active = &controller["active"][0];
+        assert_eq!(active["target"]["endpoint"]["stream_id"].as_u64(), Some(1001));
+        assert_eq!(active["scenario_name"].as_str(), Some("degraded-time"));
+        assert_eq!(active["kind"].as_str(), Some("degraded_time"));
+        assert_eq!(active["lifecycle"].as_str(), Some("transient"));
+        assert_eq!(active["start_frame_offset"].as_u64(), Some(0));
+        assert_eq!(active["first_eligible_boundary"].as_u64(), Some(0));
+        assert_eq!(active["actor_label"].as_str(), Some("active operator"));
+
+        let prepared_state = &controller["prepared"][0];
+        let prepared_token = prepared.token.value().to_string();
+        assert_eq!(prepared_state["token"].as_str(), Some(prepared_token.as_str()));
+        assert!(prepared_state["confirm_expires_in_ms"].as_u64().is_some());
+        assert_eq!(
+            prepared_state["target"]["endpoint"]["stream_id"].as_u64(),
+            Some(1002)
+        );
+        assert_eq!(
+            prepared_state["action"]["activate"]["scenario_name"].as_str(),
+            Some("missing-frames")
+        );
+        assert_eq!(prepared_state["actor_label"].as_str(), Some("prepared operator"));
+
+        let pending_state = &controller["pending"][0];
+        assert_eq!(pending_state["target"]["pdc"]["stream_id"].as_u64(), Some(1001));
+        assert_eq!(pending_state["target"]["pdc"]["connection_id"].as_u64(), Some(9));
+        assert_eq!(
+            pending_state["action"]["activate"]["scenario_name"].as_str(),
+            Some("disconnect-pdc")
+        );
+        assert_eq!(pending_state["actor_label"].as_str(), Some("pending operator"));
+
+        let console_response = server.management_console_state_response(None);
+        assert_http_status(&console_response, "HTTP/1.1 200 OK");
+        let console: serde_json::Value = serde_json::from_slice(response_body(&console_response))
+            .expect("console state response must be JSON");
+        let console_prepared = &console["scenario_controller"]["prepared"][0];
+        assert_eq!(console_prepared["token"].as_str(), Some(prepared_token.as_str()));
+        assert!(console_prepared["confirm_expires_in_ms"].as_u64().is_some());
+    }
+
+    #[test]
+    fn management_state_keeps_disconnected_pdc_targets_visible_and_clearable() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("reserve a local port");
+        let port = listener.local_addr().expect("discover local port").port();
+        drop(listener);
+
+        let profile = parse_profile(&profile(port)).expect("profile must compile");
+        let mut server = Server::bind_with_management(
+            profile,
+            maximum_occupancy_catalog(),
+            TimeSynchronizationSource::AlwaysVerified,
+            ManagementConfig {
+                bind_address: "127.0.0.1:0".parse().expect("parse management address"),
+            },
+        )
+        .expect("management-enabled server must bind");
+        let mut target = connect(port);
+        pump_until(&mut server, |server| server.endpoints[0].connections[0].is_some());
+        let connection_id = server.endpoints[0].connections[0]
+            .as_ref()
+            .expect("PDC must occupy the first slot")
+            .connection_id
+            .0;
+        activate_scenario(
+            &mut server,
+            ScenarioTarget::Pdc {
+                stream_id: 1001,
+                connection_id,
+            },
+            "disconnect-pdc",
+        );
+        emit_boundary(&mut server, 0);
+
+        assert_connection_closed(&mut target);
+        assert!(server.endpoints[0].connections[0].is_none());
+
+        let response = server.management_state_response();
+        assert_http_status(&response, "HTTP/1.1 200 OK");
+        let state: serde_json::Value = serde_json::from_slice(response_body(&response))
+            .expect("state response must be JSON");
+        assert_eq!(state["endpoints"][0]["active_connections"].as_u64(), Some(0));
+        assert_eq!(state["endpoints"][0]["connections"].as_array().map(Vec::len), Some(0));
+        let controller = &state["scenario_controller"];
+        assert_eq!(controller["active"].as_array().map(Vec::len), Some(1));
+        assert_eq!(controller["pending"].as_array().map(Vec::len), Some(0));
+        assert_eq!(controller["prepared"].as_array().map(Vec::len), Some(0));
+        assert_eq!(
+            controller["active"][0]["target"]["pdc"]["connection_id"].as_u64(),
+            Some(connection_id)
+        );
+        assert_eq!(controller["active"][0]["scenario_name"].as_str(), Some("disconnect-pdc"));
+        assert_eq!(controller["active"][0]["first_eligible_boundary"].as_u64(), Some(0));
+
+        let clear = server.management_request_response(crate::management::ManagementRequest::Clear(
+            crate::management::ClearScenarioRequest {
+                target: crate::management::ScenarioTarget {
+                    stream_id: 1001,
+                    connection_id: Some(connection_id),
+                },
+                actor_label: Some("clear disconnected PDC".to_owned()),
+            },
+        ));
+        assert_http_status(&clear, "HTTP/1.1 202 Accepted");
+        let clear: serde_json::Value = serde_json::from_slice(response_body(&clear))
+            .expect("clear response must be JSON");
+        assert!(clear["token"].as_str().is_some());
+        assert!(clear["confirm_expires_in_ms"].as_u64().is_some());
+
+        let clear_state = server.management_state_response();
+        let clear_state: serde_json::Value = serde_json::from_slice(response_body(&clear_state))
+            .expect("state response must be JSON");
+        let controller = &clear_state["scenario_controller"];
+        assert_eq!(controller["prepared"].as_array().map(Vec::len), Some(1));
+        assert_eq!(controller["prepared"][0]["target"]["pdc"]["connection_id"].as_u64(), Some(connection_id));
+        assert_eq!(controller["prepared"][0]["action"].as_str(), Some("clear"));
+        assert_eq!(
+            controller["prepared"][0]["actor_label"].as_str(),
+            Some("clear disconnected PDC")
+        );
+        assert_eq!(controller["active"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn console_cursors_reject_revised_and_restarted_state() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("reserve a local port");
+        let port = listener.local_addr().expect("discover local port").port();
+        drop(listener);
+
+        let mut server = Server::bind_with_management(
+            parse_profile(&profile(port)).expect("profile must compile"),
+            maximum_occupancy_catalog(),
+            TimeSynchronizationSource::AlwaysVerified,
+            ManagementConfig {
+                bind_address: "127.0.0.1:0".parse().expect("parse management address"),
+            },
+        )
+        .expect("management-enabled server must bind");
+        let now = Instant::now();
+        {
+            let controller = server
+                .scenario_controller_mut()
+                .expect("server must own a scenario controller");
+            for stream_id in 1001..=1049 {
+                let prepared = controller
+                    .prepare_activation(
+                        ScenarioTarget::Endpoint { stream_id },
+                        "normal",
+                        None,
+                        now,
+                    )
+                    .expect("activation must prepare");
+                controller
+                    .confirm(prepared.token, now)
+                    .expect("activation must confirm");
+            }
+            controller
+                .advance_boundary(0)
+                .expect("activations must become active");
+        }
+
+        let first = server.management_console_state_response(None);
+        assert_http_status(&first, "HTTP/1.1 200 OK");
+        let first: serde_json::Value = serde_json::from_slice(response_body(&first))
+            .expect("console response must be JSON");
+        let cursor = console_cursor_from_value(&first);
+        let first_process_identity = first["process_identity"]
+            .as_str()
+            .expect("console process identity")
+            .to_owned();
+
+        server
+            .scenario_controller_mut()
+            .expect("server must own a scenario controller")
+            .prepare_clear(ScenarioTarget::Endpoint { stream_id: 1001 }, None, now)
+            .expect("state revision must change after a clear preparation");
+        let revised = server.management_console_state_response(Some(cursor.clone()));
+        assert_http_status(&revised, "HTTP/1.1 400 Bad Request");
+        assert!(std::str::from_utf8(response_body(&revised))
+            .expect("stale response must be JSON")
+            .contains("\"code\":\"stale_console_cursor\""));
+
+        drop(server);
+        let mut restarted = Server::bind_with_management(
+            parse_profile(&profile(port)).expect("profile must compile again"),
+            maximum_occupancy_catalog(),
+            TimeSynchronizationSource::AlwaysVerified,
+            ManagementConfig {
+                bind_address: "127.0.0.1:0".parse().expect("parse management address"),
+            },
+        )
+        .expect("restarted server must bind");
+        let restarted_first = restarted.management_console_state_response(None);
+        assert_http_status(&restarted_first, "HTTP/1.1 200 OK");
+        let restarted_first: serde_json::Value = serde_json::from_slice(response_body(&restarted_first))
+            .expect("restarted console response must be JSON");
+        assert_ne!(
+            restarted_first["process_identity"].as_str(),
+            Some(first_process_identity.as_str())
+        );
+        let restarted_stale = restarted.management_console_state_response(Some(cursor));
+        assert_http_status(&restarted_stale, "HTTP/1.1 400 Bad Request");
+        assert!(std::str::from_utf8(response_body(&restarted_stale))
+            .expect("stale response must be JSON")
+            .contains("\"code\":\"stale_console_cursor\""));
+    }
+
+    #[test]
+    fn target_admission_rejects_fabrication_and_confirms_prepared_disconnected_pdcs() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("reserve a local port");
+        let port = listener.local_addr().expect("discover local port").port();
+        drop(listener);
+
+        let mut server = Server::bind_with_management(
+            parse_profile(&profile(port)).expect("profile must compile"),
+            maximum_occupancy_catalog(),
+            TimeSynchronizationSource::AlwaysVerified,
+            ManagementConfig {
+                bind_address: "127.0.0.1:0".parse().expect("parse management address"),
+            },
+        )
+        .expect("management-enabled server must bind");
+        for offset in 0..=MAX_SCENARIO_TARGETS {
+            let stream_id = 2_000_u16 + u16::try_from(offset).expect("test stream ID fits");
+            let response = server.management_request_response(
+                crate::management::ManagementRequest::Prepare(
+                    crate::management::PrepareScenarioRequest {
+                        target: crate::management::ScenarioTarget {
+                            stream_id,
+                            connection_id: None,
+                        },
+                        scenario_name: "normal".to_owned(),
+                        actor_label: None,
+                    },
+                ),
+            );
+            assert_http_status(&response, "HTTP/1.1 400 Bad Request");
+        }
+        let fabricated_pdc = server.management_request_response(
+            crate::management::ManagementRequest::Prepare(
+                crate::management::PrepareScenarioRequest {
+                    target: crate::management::ScenarioTarget {
+                        stream_id: 1001,
+                        connection_id: Some(999),
+                    },
+                    scenario_name: "disconnect-pdc".to_owned(),
+                    actor_label: None,
+                },
+            ),
+        );
+        assert_http_status(&fabricated_pdc, "HTTP/1.1 400 Bad Request");
+        assert!(server
+            .scenario_controller
+            .as_ref()
+            .expect("server must own a scenario controller")
+            .prepared_actions()
+            .is_empty());
+
+        let mut client = connect(port);
+        pump_until(&mut server, |server| server.endpoints[0].connections[0].is_some());
+        let connection_id = server.endpoints[0].connections[0]
+            .as_ref()
+            .expect("PDC must be connected")
+            .connection_id
+            .0;
+        let prepared = server.management_request_response(
+            crate::management::ManagementRequest::Prepare(
+                crate::management::PrepareScenarioRequest {
+                    target: crate::management::ScenarioTarget {
+                        stream_id: 1001,
+                        connection_id: Some(connection_id),
+                    },
+                    scenario_name: "disconnect-pdc".to_owned(),
+                    actor_label: Some("prepared PDC".to_owned()),
+                },
+            ),
+        );
+        assert_http_status(&prepared, "HTTP/1.1 202 Accepted");
+        let prepared: serde_json::Value = serde_json::from_slice(response_body(&prepared))
+            .expect("prepare response must be JSON");
+        let token = prepared["token"]
+            .as_str()
+            .expect("prepare returns a decimal-string token")
+            .parse::<u64>()
+            .expect("prepared token fits u64");
+
+        drop(
+            server.endpoints[0].connections[0]
+                .take()
+                .expect("PDC must remain connected until confirmation"),
+        );
+        assert_connection_closed(&mut client);
+        let oversized_confirmation = server.management_request_response(
+            crate::management::ManagementRequest::Confirm(
+                crate::management::ConfirmScenarioRequest {
+                    token,
+                    actor_label: Some("x".repeat(MAX_SCENARIO_ACTOR_LABEL_BYTES + 1)),
+                },
+            ),
+        );
+        assert_http_status(&oversized_confirmation, "HTTP/1.1 400 Bad Request");
+        assert!(std::str::from_utf8(response_body(&oversized_confirmation))
+            .expect("rejection response must be JSON")
+            .contains("\"code\":\"scenario_request_rejected\""));
+        assert_eq!(
+            server
+                .scenario_controller
+                .as_ref()
+                .expect("server must own a scenario controller")
+                .prepared_actions()
+                .len(),
+            1,
+            "invalid confirmation labels must not consume prepared actions"
+        );
+        let confirmed = server.management_request_response(
+            crate::management::ManagementRequest::Confirm(
+                crate::management::ConfirmScenarioRequest {
+                    token,
+                    actor_label: Some(String::new()),
+                },
+            ),
+        );
+        assert_http_status(&confirmed, "HTTP/1.1 202 Accepted");
+        emit_boundary(&mut server, 0);
+
+        let clear = server.management_request_response(crate::management::ManagementRequest::Clear(
+            crate::management::ClearScenarioRequest {
+                target: crate::management::ScenarioTarget {
+                    stream_id: 1001,
+                    connection_id: Some(connection_id),
+                },
+                actor_label: Some("clear PDC".to_owned()),
+            },
+        ));
+        assert_http_status(&clear, "HTTP/1.1 202 Accepted");
+        let clear: serde_json::Value = serde_json::from_slice(response_body(&clear))
+            .expect("clear response must be JSON");
+        let clear_token = clear["token"]
+            .as_str()
+            .expect("clear returns a decimal-string token")
+            .parse::<u64>()
+            .expect("clear token fits u64");
+        assert!(clear["confirm_expires_in_ms"].as_u64().is_some());
+        let invalid_cancel = server.management_request_response(
+            crate::management::ManagementRequest::Cancel(
+                crate::management::CancelScenarioRequest {
+                    token: clear_token,
+                    actor_label: Some("x".repeat(MAX_SCENARIO_ACTOR_LABEL_BYTES + 1)),
+                },
+            ),
+        );
+        assert_http_status(&invalid_cancel, "HTTP/1.1 400 Bad Request");
+        let cancelled = server.management_request_response(
+            crate::management::ManagementRequest::Cancel(
+                crate::management::CancelScenarioRequest {
+                    token: clear_token,
+                    actor_label: Some("cancel PDC".to_owned()),
+                },
+            ),
+        );
+        assert_http_status(&cancelled, "HTTP/1.1 202 Accepted");
+        let cancelled: serde_json::Value = serde_json::from_slice(response_body(&cancelled))
+            .expect("cancel response must be JSON");
+        assert_eq!(cancelled["actor_label"].as_str(), Some("clear PDC"));
+        assert_eq!(cancelled["action"].as_str(), Some("clear"));
+        let snapshot = server
+            .scenario_controller_mut()
+            .expect("server must own a scenario controller")
+            .snapshot(Instant::now());
+        assert_eq!(snapshot.active.len(), 1);
+        assert_eq!(snapshot.active[0].actor_label.as_deref(), Some("prepared PDC"));
+        assert!(snapshot.prepared.is_empty());
+        assert!(snapshot.pending.is_empty());
+    }
+
+    #[test]
+    fn invalid_runtime_metadata_cannot_turn_state_reads_into_500() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("reserve a local port");
+        let port = listener.local_addr().expect("discover local port").port();
+        drop(listener);
+
+        let mut server = Server::bind_with_management(
+            parse_profile(&profile(port)).expect("profile must compile"),
+            baseline_catalog(),
+            TimeSynchronizationSource::AlwaysVerified,
+            ManagementConfig {
+                bind_address: "127.0.0.1:0".parse().expect("parse management address"),
+            },
+        )
+        .expect("management-enabled server must bind");
+        assert!(!server.configure_runtime_metadata(
+            "deployment".to_owned(),
+            RuntimeIdentity {
+                image_ref: "x".repeat(256),
+                profile_sha256: "A".repeat(64),
+                scenario_catalog_sha256: "0".repeat(64),
+            },
+        ));
+        let state = server.management_state_response();
+        assert_http_status(&state, "HTTP/1.1 200 OK");
+        let state: serde_json::Value = serde_json::from_slice(response_body(&state))
+            .expect("state response must be JSON");
+        assert!(state.get("runtime_metadata").is_none());
+        let console = server.management_console_state_response(None);
+        assert_http_status(&console, "HTTP/1.1 200 OK");
+        assert!(response_body(&console).len() <= MAX_RESPONSE_BODY_BYTES);
+
+        assert!(server.configure_runtime_metadata(
+            "deployment".to_owned(),
+            RuntimeIdentity::new("image", b"profile", b"catalog"),
+        ));
+        assert!(!server.configure_runtime_metadata(
+            "\n".to_owned(),
+            RuntimeIdentity::new("image", b"profile", b"catalog"),
+        ));
+        let retained = server.management_state_response();
+        assert_http_status(&retained, "HTTP/1.1 200 OK");
+        let retained: serde_json::Value = serde_json::from_slice(response_body(&retained))
+            .expect("retained state response must be JSON");
+        assert_eq!(
+            retained["runtime_metadata"]["deployment_label"].as_str(),
+            Some("deployment")
+        );
     }
 
     #[test]
@@ -2280,8 +3932,10 @@ mod tests {
         assert!(state.contains("\"ready\":true"));
         assert!(state.contains("\"time_health\":"));
         assert!(state.contains("\"stats\":"));
+        assert!(state.contains("\"fleet\":"));
         assert!(state.contains("\"stream_id\":1001"));
         assert!(state.contains("\"active_connections\":0"));
+        assert!(state.contains("\"connections\":[]"));
         assert!(state.contains("\"scenario_controller\":"));
 
         let metrics = management_get(management_address, "/metrics");
@@ -2303,6 +3957,50 @@ mod tests {
         }
 
         let _ = handle.join().expect("server thread must finish");
+    }
+
+    #[test]
+    fn management_loopback_preserves_the_configured_pdc_name_for_v2_and_v3() {
+        for (build_profile, expected_wire_version) in [
+            (profile as fn(u16) -> String, 3_u64),
+            (v2_profile as fn(u16) -> String, 2_u64),
+        ] {
+            let listener = StdTcpListener::bind("127.0.0.1:0").expect("reserve a local port");
+            let port = listener.local_addr().expect("discover local port").port();
+            drop(listener);
+
+            let profile = parse_profile(&build_profile(port)).expect("profile must compile");
+            let server = Server::bind_with_management(
+                profile,
+                baseline_catalog(),
+                TimeSynchronizationSource::AlwaysVerified,
+                ManagementConfig {
+                    bind_address: "127.0.0.1:0".parse().expect("parse management address"),
+                },
+            )
+            .expect("management-enabled server must bind");
+            let management_address = server
+                .management_address()
+                .expect("management listener must expose its bound address");
+            let handle = thread::spawn(move || {
+                let mut server = server;
+                server
+                    .run_for(Duration::from_secs(3))
+                    .expect("server must run")
+            });
+
+            let state_response = management_get(management_address, "/v1/state");
+            assert_http_status(&state_response, "HTTP/1.1 200 OK");
+            let state: serde_json::Value = serde_json::from_slice(response_body(&state_response))
+                .expect("state response must be JSON");
+            assert_eq!(state["fleet"]["pdc_name"].as_str(), Some("WAMA"));
+            assert_eq!(
+                state["fleet"]["wire_version"].as_u64(),
+                Some(expected_wire_version)
+            );
+
+            let _ = handle.join().expect("server thread must finish");
+        }
     }
 
     #[test]
@@ -2364,7 +4062,46 @@ mod tests {
         assert_http_status(&prepared, "HTTP/1.1 202 Accepted");
         let prepared: serde_json::Value = serde_json::from_slice(response_body(&prepared))
             .expect("prepare response must be JSON");
-        let token = prepared["token"].as_u64().expect("prepare response token");
+        let cancel_token = prepared["token"]
+            .as_str()
+            .expect("prepare response token is a decimal string")
+            .to_owned();
+        assert!(prepared["confirm_expires_in_ms"].as_u64().is_some());
+
+        let cancelled = management_post(
+            management_address,
+            "/v1/scenarios/cancel",
+            &format!(
+                r#"{{"token":"{cancel_token}","actor_label":"canceller"}}"#,
+            ),
+        );
+        assert_http_status(&cancelled, "HTTP/1.1 202 Accepted");
+        let cancelled: serde_json::Value = serde_json::from_slice(response_body(&cancelled))
+            .expect("cancel response must be JSON");
+        assert_eq!(cancelled["token"].as_str(), Some(cancel_token.as_str()));
+        assert_eq!(cancelled["actor_label"].as_str(), Some("test"));
+        assert!(cancelled["confirm_expires_in_ms"].as_u64().is_some());
+
+        let cancelled_again = management_post(
+            management_address,
+            "/v1/scenarios/cancel",
+            &format!(r#"{{"token":"{cancel_token}"}}"#),
+        );
+        assert_http_status(&cancelled_again, "HTTP/1.1 400 Bad Request");
+
+        let prepared = management_post(
+            management_address,
+            "/v1/scenarios/prepare",
+            r#"{"target":{"stream_id":1001},"scenario_name":"degraded-time","actor_label":"test"}"#,
+        );
+        assert_http_status(&prepared, "HTTP/1.1 202 Accepted");
+        let prepared: serde_json::Value = serde_json::from_slice(response_body(&prepared))
+            .expect("replacement prepare response must be JSON");
+        let token = prepared["token"]
+            .as_str()
+            .expect("replacement prepare response token")
+            .parse::<u64>()
+            .expect("replacement prepared token fits u64");
 
         let confirmed = management_post(
             management_address,

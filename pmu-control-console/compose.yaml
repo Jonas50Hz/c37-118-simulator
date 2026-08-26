@@ -1,0 +1,31 @@
+services:
+  pmu-control-console:
+    image: caddy:2-alpine
+    ports:
+      - "${C37_118_CONSOLE_BIND_ADDRESS:-0.0.0.0}:${C37_118_CONSOLE_PORT:-8081}:80"
+    volumes:
+      - type: bind
+        source: ./Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+      - type: bind
+        source: ./index.html
+        target: /usr/share/caddy/index.html
+        read_only: true
+      - type: bind
+        source: ./styles.css
+        target: /usr/share/caddy/styles.css
+        read_only: true
+      - type: bind
+        source: ./app.js
+        target: /usr/share/caddy/app.js
+        read_only: true
+    networks:
+      - wama-infra
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped

@@ -42,11 +42,18 @@ network boundary and does not implement TLS or application authentication.
 ## Run
 
 The project never starts itself or the WAMA infrastructure. Its external
-network must already exist, normally after the infrastructure repository has
-created `wama-infra`. Start or rebuild the default five-PMU V2 fixture manually:
+network is normally created by the infrastructure repository, but an operator
+can provision the compatible default network when running the simulator alone.
+An existing network is inspected and left untouched; Compose treats it as
+external, so `docker compose down` must not remove it. Start or rebuild the
+default five-PMU V2 fixture manually:
 
 ```sh
-docker network inspect "${WAMA_INFRA_NETWORK:-wama-infra}" >/dev/null
+network_name="${WAMA_INFRA_NETWORK:-wama-infra}"
+if ! docker network inspect "$network_name" >/dev/null 2>&1; then
+  docker network create --driver bridge --subnet 172.30.0.0/24 \
+    --ip-range 172.30.0.128/25 "$network_name"
+fi
 docker compose up -d --build
 ```
 
@@ -107,11 +114,29 @@ docker compose exec c37-118-simulator \
   c37-118-simulator healthcheck --management-address 127.0.0.1:8080
 ```
 
-The API exposes `GET /healthz`, `GET /readyz`, `GET /metrics`, and
-`GET /v1/state`. Scenario control uses `POST /v1/scenarios/prepare`,
-`POST /v1/scenarios/confirm`, and `POST /v1/scenarios/clear`. The detailed
-request and response contract is in
+The API exposes `GET /healthz`, `GET /readyz`, `GET /metrics`,
+`GET /v1/catalog`, and `GET /v1/state`. The catalog is the immutable startup
+scenario read model, including scenario kind, target compatibility, lifecycle,
+frame-relative timing, duration, and signal excursions where configured. State
+preserves runtime and scenario-controller facts while adding browser-ready PMU
+identity, listener, wire, text-name, reporting, Time Health, PDC, and active
+scenario facts. Scenario control uses `POST /v1/scenarios/prepare`,
+`POST /v1/scenarios/confirm`, `POST /v1/scenarios/cancel`, and
+`POST /v1/scenarios/clear`. Cancellation uses a canonical decimal-string
+token and an optional actor label, and changes neither pending nor active
+actions. The detailed request and response contract is in
 [docs/c37-118-simulator.md](docs/c37-118-simulator.md).
+
+The desktop PMU Control Console is served at `http://<host>:8081` by default
+inside the trusted-network boundary. It uses same-origin `/api` proxying and
+adds no TLS or application authentication. The console requires a nonempty,
+unverified Console Operator Label and offers only target-local compatible Fault
+Scenario actions. Each action follows `prepare -> explicit confirm -> pending
+-> active`; the server provides `confirm_expires_in_ms` and canonical decimal-
+string tokens, while numeric confirm tokens remain accepted for legacy
+compatibility. Preparation cancellation is scoped to its token, including a
+prepared clear. Sustained scenarios use the same prepare/confirm flow to clear;
+there are no batch actions or simulator lifecycle controls.
 
 The server logs JSON lines. Startup and scenario-control records include the
 deployment label and runtime identity, which contains the image reference and

@@ -1,5 +1,8 @@
 name: c37-118-simulator
 
+include:
+  - path: ./pmu-control-console/compose.yaml
+
 services:
   c37-118-simulator:
     build:

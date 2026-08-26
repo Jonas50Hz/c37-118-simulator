@@ -193,9 +193,23 @@ names without `-v2` remain V3.
 
 The default Forgejo onboarding demonstration profile is `five-pmu-v2.yaml`.
 This repository's Compose project assigns the manually started simulator its
-stable `172.30.0.10` address on the external `wama-infra` network; the profile
-configures listeners `4712` through `4716`, with matching stream and PMU IDs
-`1001` through `1005`. Its
+stable `172.30.0.10` address on the external `wama-infra` network; the normal
+infrastructure stack remains the usual creator of that network. For a
+standalone run, the operator can provision the compatible default network
+first. The inspect-then-create sequence is idempotent and leaves an existing
+network untouched. Compose must not remove this external network, so do not use
+`docker compose down` for cleanup:
+
+```sh
+network_name="${WAMA_INFRA_NETWORK:-wama-infra}"
+if ! docker network inspect "$network_name" >/dev/null 2>&1; then
+  docker network create --driver bridge --subnet 172.30.0.0/24 \
+    --ip-range 172.30.0.128/25 "$network_name"
+fi
+```
+
+The profile configures listeners `4712` through `4716`, with matching stream
+and PMU IDs `1001` through `1005`. Its
 `v2_good_stat_pmu_ids` lists only `1001` and `1002`:
 
 ```sh
@@ -240,6 +254,7 @@ limit. Errors use this JSON envelope:
 | `GET /v1/state` | `200` JSON | Runtime identity, Time Health, counters, PDC connection IDs, and scenario-controller state. |
 | `POST /v1/scenarios/prepare` | `202` JSON | Prepares a named Fault Scenario for an endpoint or PDC target. |
 | `POST /v1/scenarios/confirm` | `202` JSON | Consumes a 60-second preparation token and queues the action for the next reporting boundary. |
+| `POST /v1/scenarios/cancel` | `202` JSON | Cancels a prepared action by canonical decimal-string token, with an optional actor label; pending and active actions are unchanged. |
 | `POST /v1/scenarios/clear` | `202` JSON | Prepares a confirmed clear for an active sustained scenario. |
 
 `POST /v1/scenarios/prepare` accepts the following shape. Omit
@@ -254,11 +269,34 @@ the other shipped scenarios require an endpoint target.
 }
 ```
 
-`POST /v1/scenarios/confirm` accepts `{"token":42}`. The optional
-`actor_label` fields are recorded as unverified attribution in JSON logs; they
-are not authentication. One target can have only one prepared, pending, or
-active scenario. A transient scenario clears itself after its frame-relative
-duration. A sustained scenario requires the same prepare/confirm flow to clear.
+The desktop PMU Control Console is available at `http://<host>:8081` by
+default. It is intended for the trusted-network boundary and adds no TLS or
+application authentication. Its same-origin `/api` requests are proxied to
+the Management Plane. The console is desktop-only and controls exactly one
+Scenario Target at a time: a compatible endpoint-local Fault Scenario action
+or a target-local `disconnect-pdc` action. It has no batch controls and does
+not control startup profiles, PMU identity, capacity, wire version, or
+simulator lifecycle.
+
+The Console Operator Label is required and nonempty. It is unverified
+attribution, not authentication, and is retained only in page memory. The
+console presents the selected Console Scenario Detail, prepares the action,
+and requires an explicit second confirmation. The server response supplies the
+preparation token and `confirm_expires_in_ms`; the console uses that server
+value when showing the confirmation window. The observable sequence is
+`prepare -> explicit confirm -> pending -> active`, with activation applied at
+the next reporting boundary.
+
+Tokens are canonical positive decimal strings in JSON, including the token in
+the preparation response and the `token` value sent to confirm. The confirm
+operation also accepts the legacy numeric token form for compatibility. A
+preparation cancellation is scoped to its token and releases only that
+prepared action; it does not cancel an active Fault Scenario. A prepared clear
+uses the same token-scoped cancellation and confirmation rules. `clear` is
+available only for an active sustained scenario and starts the confirmed clear
+flow; it is not an immediate clear. A transient scenario clears itself after
+its frame-relative duration. One target can have only one prepared, pending, or
+active scenario.
 
 Startup logs, `/readyz`, `/v1/state`, and `c37_118_simulator_runtime_info`
 identify the deployment label, image reference, profile SHA-256, and scenario

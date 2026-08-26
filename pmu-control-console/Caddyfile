@@ -1,0 +1,9 @@
+:80 {
+    root * /usr/share/caddy
+
+    handle_path /api/* {
+        reverse_proxy c37-118-simulator:8080
+    }
+
+    file_server
+}
