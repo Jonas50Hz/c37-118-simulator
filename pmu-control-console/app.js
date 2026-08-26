@@ -1211,6 +1211,16 @@ function pdcDetailsKey(endpoint) {
   return `stream:${endpoint.streamId}`;
 }
 
+function pdcDetailsStateKey(endpoint, snapshot) {
+  const connectionIds = pdcConnectionRowsForEndpoint(endpoint, snapshot)
+    .map(({ connectionId }) => connectionId);
+  return JSON.stringify({
+    processIdentity: snapshot.processIdentity,
+    streamId: endpoint.streamId,
+    connectionIds,
+  });
+}
+
 function pdcConnectionRowsForEndpoint(endpoint, snapshot) {
   const liveConnections = new Map(
     endpoint.connections.map((connection) => [connection.connectionId, connection]),
@@ -1308,10 +1318,25 @@ function createPdcDetailsSummary(endpoint, snapshot) {
   return summary;
 }
 
+  function createPdcConnectionField(label, value, valueClassName = "") {
+    const field = createElement("div", { className: "pdc-connection__field" });
+    const description = createElement("dd", {
+      className: `pdc-connection__value ${valueClassName}`.trim(),
+      text: value,
+    });
+    return appendChildren(field, [
+      createElement("dt", { text: label }),
+      description,
+    ]);
+  }
+
 function createPdcDetails(endpoint, snapshot, controls) {
   const details = createElement("details", {
     className: "pdc-details",
-    attributes: { "data-pdc-details-key": pdcDetailsKey(endpoint) },
+    attributes: {
+      "data-pdc-details-key": pdcDetailsKey(endpoint),
+      "data-pdc-details-state-key": pdcDetailsStateKey(endpoint, snapshot),
+    },
   });
   const connectionRows = pdcConnectionRowsForEndpoint(endpoint, snapshot);
   details.append(createPdcDetailsSummary(endpoint, snapshot));
@@ -1322,45 +1347,39 @@ function createPdcDetails(endpoint, snapshot, controls) {
     return details;
   }
 
-  const table = createElement("table", { className: "pdc-table" });
-  table.append(createElement("caption", {
-    className: "screen-reader-text",
-    text: `PDC connection details for stream ${endpoint.streamId}`,
-  }));
-  const tableHead = createElement("thead");
-  const headerRow = createElement("tr");
-  for (const label of ["Connection ID", "State", "Streaming", "Scenario Controls"]) {
-    headerRow.append(createElement("th", { text: label, attributes: { scope: "col" } }));
-  }
-  tableHead.append(headerRow);
-  const tableBody = createElement("tbody");
+  const connectionList = createElement("div", { className: "pdc-connection-list" });
   for (const { connectionId, connection } of connectionRows) {
-    const row = createElement("tr");
-    const scenarioControls = createElement("td", { className: "scenario-controls-cell" });
+    const connectionDetails = createElement("dl", {
+      className: "pdc-connection",
+      attributes: {
+        "aria-label": `PDC connection ${connectionId} details for stream ${endpoint.streamId}`,
+      },
+    });
+    const scenarioControls = createElement("dd", { className: "pdc-connection__value" });
     scenarioControls.append(createTargetScenarioControls({
       kind: "pdc",
       streamId: endpoint.streamId,
       connectionId,
     }, snapshot, controls));
-    appendChildren(row, [
-      createCell(String(connectionId), "numeric-cell"),
-      createCell(connection === null ? "Disconnected" : connection.streaming ? "Streaming" : "Connected"),
-      createCell(connection?.streaming ? "Yes" : "No"),
+    const controlsField = createElement("div", {
+      className: "pdc-connection__field pdc-connection__field--controls",
+    });
+    appendChildren(controlsField, [
+      createElement("dt", { text: "Scenario Controls" }),
       scenarioControls,
     ]);
-    tableBody.append(row);
+    appendChildren(connectionDetails, [
+      createPdcConnectionField("Connection ID", String(connectionId), "numeric-cell"),
+      createPdcConnectionField(
+        "State",
+        connection === null ? "Disconnected" : connection.streaming ? "Streaming" : "Connected",
+      ),
+      createPdcConnectionField("Streaming", connection?.streaming ? "Yes" : "No"),
+      controlsField,
+    ]);
+    connectionList.append(connectionDetails);
   }
-  appendChildren(table, [tableHead, tableBody]);
-  const tableScroll = createElement("div", {
-    className: "pdc-table-scroll",
-    attributes: {
-      tabindex: "0",
-      "aria-label": `PDC connection details for stream ${endpoint.streamId}`,
-      "data-focus-key": `pdc-table:${pdcDetailsKey(endpoint)}`,
-    },
-  });
-  tableScroll.append(table);
-  details.append(tableScroll);
+  details.append(connectionList);
   return details;
 }
 
@@ -1624,6 +1643,8 @@ function bootstrap() {
   let pollTimer = null;
   let connectionPresentation = "unavailable";
   let managementRequestInFlight = false;
+  let managementRequestDialogInstance = null;
+  let managementRequestProcessIdentity = null;
   let dialogState = null;
 
   function managementControlsEnabled() {
@@ -1710,7 +1731,11 @@ function bootstrap() {
       setOperationStatus("info", "Scenario actions are available on desktop viewports.");
       return;
     }
-    dialogState = nextDialogState;
+    dialogState = {
+      ...nextDialogState,
+      processIdentity: completeSnapshot?.processIdentity ?? null,
+      instance: Symbol("scenario-dialog"),
+    };
     renderScenarioDialog();
   }
 
@@ -1765,7 +1790,12 @@ function bootstrap() {
       text: "Close",
       attributes: { type: "button" },
     });
-    closeButton.addEventListener("click", closeScenarioDialog);
+    closeButton.addEventListener("click", () => {
+      if (!isCurrentScenarioDialog(state.instance, state.processIdentity)) {
+        return;
+      }
+      closeScenarioDialog();
+    });
     const submitButton = createElement("button", {
       className: "scenario-action scenario-action--confirm",
       text: submitLabel,
@@ -1779,6 +1809,9 @@ function bootstrap() {
     form.append(field, actions);
     form.addEventListener("submit", (event) => {
       event.preventDefault();
+      if (!isCurrentScenarioDialog(state.instance, state.processIdentity)) {
+        return;
+      }
       const actorLabel = input.value.trim();
       if (actorLabel === "") {
         input.setCustomValidity("Enter an operator label.");
@@ -1799,8 +1832,17 @@ function bootstrap() {
     return { form, input };
   }
 
-  function preparedRecord(token) {
-    if (completeSnapshot === null) {
+  function isCurrentScenarioDialog(expectedDialogInstance, expectedProcessIdentity) {
+    return dialogState !== null
+      && dialogState.instance === expectedDialogInstance
+      && dialogState.processIdentity === expectedProcessIdentity;
+  }
+
+  function preparedRecord(token, expectedProcessIdentity) {
+    if (
+      completeSnapshot === null
+      || completeSnapshot.processIdentity !== expectedProcessIdentity
+    ) {
       return null;
     }
     return completeSnapshot.scenarioController.prepared.find((record) => record.token === token) ?? null;
@@ -1811,33 +1853,42 @@ function bootstrap() {
       return;
     }
 
+    const dialogProcessIdentity = dialogState.processIdentity;
+  const dialogInstance = dialogState.instance;
     const fragment = document.createDocumentFragment();
     let form = null;
     let focusInput = null;
     if (dialogState.type === "prepare") {
+      const target = dialogState.target;
+      const scenario = dialogState.scenario;
       fragment.append(createScenarioDialogHeader(
         "Prepare scenario",
-        dialogState.target,
-        `Prepare ${dialogState.scenario.name}. Confirmation will be required before it runs.`,
+        target,
+        `Prepare ${scenario.name}. Confirmation will be required before it runs.`,
       ));
       const operatorForm = createOperatorForm(dialogState, "Prepare scenario", (actorLabel) => {
-        void submitPrepareScenario(dialogState.target, dialogState.scenario, actorLabel);
+        void submitPrepareScenario(target, scenario, actorLabel, dialogProcessIdentity, dialogInstance);
       });
       form = operatorForm.form;
       focusInput = operatorForm.input;
     } else if (dialogState.type === "clear") {
+      const target = dialogState.target;
       fragment.append(createScenarioDialogHeader(
         "Prepare clear",
-        dialogState.target,
+        target,
         `Prepare a clear for sustained scenario ${dialogState.activeScenario.scenarioName}. Confirmation will be required.`,
       ));
       const operatorForm = createOperatorForm(dialogState, "Prepare clear", (actorLabel) => {
-        void submitClearScenario(dialogState.target, actorLabel);
+        void submitClearScenario(target, actorLabel, dialogProcessIdentity, dialogInstance);
       });
       form = operatorForm.form;
       focusInput = operatorForm.input;
     } else {
-      const record = preparedRecord(dialogState.record.token) ?? dialogState.record;
+      const record = preparedRecord(dialogState.record.token, dialogProcessIdentity);
+      if (record === null) {
+        closeScenarioDialog();
+        return;
+      }
       dialogState.record = record;
       const expiresAt = confirmationExpiresAt(record);
       const expired = expiresAt <= Date.now();
@@ -1862,9 +1913,9 @@ function bootstrap() {
         isCancellation ? "Cancel prepared action" : "Confirm",
         (actorLabel) => {
           if (isCancellation) {
-            void submitCancellation(record, actorLabel);
+            void submitCancellation(record, actorLabel, dialogProcessIdentity, dialogInstance);
           } else {
-            void submitConfirmation(record, actorLabel);
+            void submitConfirmation(record, actorLabel, dialogProcessIdentity, dialogInstance);
           }
         },
       );
@@ -1906,6 +1957,13 @@ function bootstrap() {
       return;
     }
     const announceUnavailable = options.announceUnavailable !== false;
+    if (dialogState.processIdentity !== completeSnapshot.processIdentity) {
+      closeUnavailableScenarioDialog(
+        "The simulator process restarted. The scenario action is no longer available.",
+        announceUnavailable,
+      );
+      return;
+    }
     if (dialogState.type === "prepare") {
       const availability = targetScenarioAvailability(completeSnapshot, dialogState.target);
       const scenarioAvailable = scenariosForTarget(completeSnapshot, dialogState.target)
@@ -1940,7 +1998,7 @@ function bootstrap() {
       return;
     }
 
-    const currentRecord = preparedRecord(dialogState.record.token);
+    const currentRecord = preparedRecord(dialogState.record.token, dialogState.processIdentity);
     if (currentRecord === null) {
       if (!managementRequestInFlight) {
         closeUnavailableScenarioDialog(
@@ -1979,21 +2037,53 @@ function bootstrap() {
     return candidates.find((record) => record.actorLabel === actorLabel) ?? candidates[0] ?? null;
   }
 
-  function beginManagementRequest() {
+  function beginManagementRequest(expectedProcessIdentity, expectedDialogInstance) {
+    if (!isCurrentScenarioDialog(expectedDialogInstance, expectedProcessIdentity)) {
+      return false;
+    }
+    if (
+      completeSnapshot === null
+      || completeSnapshot.processIdentity !== expectedProcessIdentity
+    ) {
+      closeScenarioDialog();
+      return false;
+    }
     if (!managementControlsEnabled()) {
       setOperationStatus("error", "Scenario management is unavailable until the console has a current snapshot.");
       return false;
     }
     managementRequestInFlight = true;
+    managementRequestDialogInstance = expectedDialogInstance;
+    managementRequestProcessIdentity = expectedProcessIdentity;
     clearOperationStatus();
     setManagementControlsEnabled();
     return true;
   }
 
-  function finishManagementRequest() {
+  function isCurrentManagementRequest(expectedProcessIdentity, expectedDialogInstance) {
+    return managementRequestInFlight
+      && managementRequestDialogInstance === expectedDialogInstance
+      && managementRequestProcessIdentity === expectedProcessIdentity
+      && isCurrentScenarioDialog(expectedDialogInstance, expectedProcessIdentity)
+      && completeSnapshot !== null
+      && completeSnapshot.processIdentity === expectedProcessIdentity;
+  }
+
+  function finishManagementRequest(expectedProcessIdentity, expectedDialogInstance) {
+    if (
+      !managementRequestInFlight
+      || managementRequestDialogInstance !== expectedDialogInstance
+      || managementRequestProcessIdentity !== expectedProcessIdentity
+    ) {
+      return;
+    }
     managementRequestInFlight = false;
+    managementRequestDialogInstance = null;
+    managementRequestProcessIdentity = null;
     setManagementControlsEnabled();
-    reconcileScenarioDialog({ announceUnavailable: false });
+    if (isCurrentScenarioDialog(expectedDialogInstance, expectedProcessIdentity)) {
+      reconcileScenarioDialog({ announceUnavailable: false });
+    }
   }
 
   function requestFailureMessage(error) {
@@ -2002,8 +2092,17 @@ function bootstrap() {
       : "The scenario management request could not be completed.";
   }
 
-  async function submitPreparedAction(endpoint, body, target, action, actorLabel, successMessage) {
-    if (!beginManagementRequest()) {
+  async function submitPreparedAction(
+    endpoint,
+    body,
+    target,
+    action,
+    actorLabel,
+    successMessage,
+    expectedProcessIdentity,
+    expectedDialogInstance,
+  ) {
+    if (!beginManagementRequest(expectedProcessIdentity, expectedDialogInstance)) {
       return;
     }
     let failureMessage = null;
@@ -2014,7 +2113,13 @@ function bootstrap() {
     }
 
     try {
+      if (!isCurrentManagementRequest(expectedProcessIdentity, expectedDialogInstance)) {
+        return;
+      }
       const snapshot = await refresh({ fresh: true });
+      if (!isCurrentManagementRequest(expectedProcessIdentity, expectedDialogInstance)) {
+        return;
+      }
       if (failureMessage !== null) {
         setOperationStatus("error", failureMessage);
         return;
@@ -2033,11 +2138,17 @@ function bootstrap() {
         showScenarioDialog({ type: "confirm", record, actorLabel });
       }
     } finally {
-      finishManagementRequest();
+      finishManagementRequest(expectedProcessIdentity, expectedDialogInstance);
     }
   }
 
-  async function submitPrepareScenario(target, scenario, actorLabel) {
+  async function submitPrepareScenario(
+    target,
+    scenario,
+    actorLabel,
+    expectedProcessIdentity,
+    expectedDialogInstance,
+  ) {
     await submitPreparedAction(
       "prepare",
       {
@@ -2049,10 +2160,17 @@ function bootstrap() {
       { kind: "activate", scenarioName: scenario.name },
       actorLabel,
       `${scenario.name} was prepared.`,
+      expectedProcessIdentity,
+      expectedDialogInstance,
     );
   }
 
-  async function submitClearScenario(target, actorLabel) {
+  async function submitClearScenario(
+    target,
+    actorLabel,
+    expectedProcessIdentity,
+    expectedDialogInstance,
+  ) {
     await submitPreparedAction(
       "clear",
       {
@@ -2063,14 +2181,37 @@ function bootstrap() {
       { kind: "clear", scenarioName: null },
       actorLabel,
       "The clear action was prepared.",
+      expectedProcessIdentity,
+      expectedDialogInstance,
     );
   }
 
-  async function submitConfirmation(record, actorLabel) {
-    if (!beginManagementRequest()) {
+  async function submitConfirmation(
+    record,
+    actorLabel,
+    expectedProcessIdentity,
+    expectedDialogInstance,
+  ) {
+    if (!isCurrentScenarioDialog(expectedDialogInstance, expectedProcessIdentity)) {
       return;
     }
-    const token = record.token;
+    const currentRecord = preparedRecord(record.token, expectedProcessIdentity);
+    if (currentRecord === null) {
+      closeScenarioDialog();
+      return;
+    }
+    if (confirmationExpiresAt(currentRecord) <= Date.now()) {
+      closeUnavailableScenarioDialog(
+        "The prepared action has expired. Refreshing the console state.",
+        true,
+      );
+      void refresh({ fresh: true });
+      return;
+    }
+    if (!beginManagementRequest(expectedProcessIdentity, expectedDialogInstance)) {
+      return;
+    }
+    const token = currentRecord.token;
     let failureMessage = null;
     try {
       await postScenarioAction("confirm", { token, actor_label: actorLabel });
@@ -2079,10 +2220,16 @@ function bootstrap() {
     }
 
     try {
+      if (!isCurrentManagementRequest(expectedProcessIdentity, expectedDialogInstance)) {
+        return;
+      }
+      const snapshot = await refresh({ fresh: true });
+      if (!isCurrentManagementRequest(expectedProcessIdentity, expectedDialogInstance)) {
+        return;
+      }
       if (failureMessage === null) {
         closeScenarioDialog();
       }
-      const snapshot = await refresh({ fresh: true });
       setOperationStatus(
         failureMessage === null ? "success" : "error",
         failureMessage === null
@@ -2092,12 +2239,24 @@ function bootstrap() {
           : failureMessage,
       );
     } finally {
-      finishManagementRequest();
+      finishManagementRequest(expectedProcessIdentity, expectedDialogInstance);
     }
   }
 
-  async function submitCancellation(record, actorLabel) {
-    const currentRecord = preparedRecord(record.token) ?? record;
+  async function submitCancellation(
+    record,
+    actorLabel,
+    expectedProcessIdentity,
+    expectedDialogInstance,
+  ) {
+    if (!isCurrentScenarioDialog(expectedDialogInstance, expectedProcessIdentity)) {
+      return;
+    }
+    const currentRecord = preparedRecord(record.token, expectedProcessIdentity);
+    if (currentRecord === null) {
+      closeScenarioDialog();
+      return;
+    }
     if (confirmationExpiresAt(currentRecord) <= Date.now()) {
       closeUnavailableScenarioDialog(
         "The prepared action has expired. Refreshing the console state.",
@@ -2106,7 +2265,7 @@ function bootstrap() {
       void refresh({ fresh: true });
       return;
     }
-    if (!beginManagementRequest()) {
+    if (!beginManagementRequest(expectedProcessIdentity, expectedDialogInstance)) {
       return;
     }
     let failureMessage = null;
@@ -2117,10 +2276,16 @@ function bootstrap() {
     }
 
     try {
+      if (!isCurrentManagementRequest(expectedProcessIdentity, expectedDialogInstance)) {
+        return;
+      }
+      const snapshot = await refresh({ fresh: true });
+      if (!isCurrentManagementRequest(expectedProcessIdentity, expectedDialogInstance)) {
+        return;
+      }
       if (failureMessage === null) {
         closeScenarioDialog();
       }
-      const snapshot = await refresh({ fresh: true });
       setOperationStatus(
         failureMessage === null ? "success" : "error",
         failureMessage === null
@@ -2130,7 +2295,7 @@ function bootstrap() {
           : failureMessage,
       );
     } finally {
-      finishManagementRequest();
+      finishManagementRequest(expectedProcessIdentity, expectedDialogInstance);
     }
   }
 
@@ -2277,33 +2442,81 @@ function bootstrap() {
     return focusState;
   }
 
+  function captureDocumentScrollState() {
+    const scrollingElement = document.scrollingElement;
+    if (scrollingElement === null) {
+      return null;
+    }
+    return {
+      left: scrollingElement.scrollLeft,
+      top: scrollingElement.scrollTop,
+    };
+  }
+
+  function restoreDocumentScrollState(state) {
+    if (state === null) {
+      return;
+    }
+    const scrollingElement = document.scrollingElement;
+    if (scrollingElement === null) {
+      return;
+    }
+    scrollingElement.scrollLeft = state.left;
+    scrollingElement.scrollTop = state.top;
+  }
+
+  function capturePmuTableScrollState() {
+    const tableScroll = content.querySelector(".pmu-table")?.parentElement ?? null;
+    if (tableScroll === null || !tableScroll.classList.contains("table-scroll")) {
+      return null;
+    }
+    return {
+      left: tableScroll.scrollLeft,
+      top: tableScroll.scrollTop,
+    };
+  }
+
+  function restorePmuTableScrollState(state) {
+    if (state === null) {
+      return;
+    }
+    const tableScroll = content.querySelector(".pmu-table")?.parentElement ?? null;
+    if (tableScroll === null || !tableScroll.classList.contains("table-scroll")) {
+      return;
+    }
+    tableScroll.scrollLeft = state.left;
+    tableScroll.scrollTop = state.top;
+  }
+
   function capturePdcDetailsState() {
     const openKeys = new Set();
     for (const details of content.querySelectorAll("details[data-pdc-details-key]")) {
-      const key = details.dataset.pdcDetailsKey;
-      if (key === undefined) {
+      const stateKey = details.dataset.pdcDetailsStateKey;
+      if (stateKey === undefined) {
         continue;
       }
       if (details.open) {
-        openKeys.add(key);
+        openKeys.add(stateKey);
       }
     }
-    return { openKeys };
+      return { openKeys };
   }
 
   function restorePdcDetailsState(state) {
     for (const details of content.querySelectorAll("details[data-pdc-details-key]")) {
-      const key = details.dataset.pdcDetailsKey;
-      if (key === undefined) {
+      const stateKey = details.dataset.pdcDetailsStateKey;
+      if (stateKey === undefined) {
         continue;
       }
-      if (state.openKeys.has(key)) {
+      if (state.openKeys.has(stateKey)) {
         details.open = true;
       }
     }
   }
 
-  function renderCompleteSnapshot(focusState = captureContentFocus()) {
+  function renderCompleteSnapshot(focusState = captureContentFocus(), options = {}) {
+    const documentScrollState = captureDocumentScrollState();
+    const pmuTableScrollState = capturePmuTableScrollState();
     const pdcDetailsState = capturePdcDetailsState();
     const replacement = buildSnapshotContent(
       completeSnapshot,
@@ -2311,33 +2524,37 @@ function bootstrap() {
       renderCompleteSnapshot,
       scenarioControls(),
     );
-    if (!preserveOpenScenarioRunMenu(replacement)) {
+    if (options.preserveOpenMenu === false || !preserveOpenScenarioRunMenu(replacement)) {
       content.replaceChildren(replacement);
     }
     restorePdcDetailsState(pdcDetailsState);
     setManagementControlsEnabled();
     reconcileScenarioDialog();
-    if (focusState === null) {
-      return;
+    if (focusState !== null) {
+      const control = focusState.focusKey === undefined
+        ? document.getElementById(focusState.id)
+        : [...content.querySelectorAll("[data-focus-key]")].find((candidate) => {
+          return candidate.getAttribute("data-focus-key") === focusState.focusKey;
+        }) ?? null;
+      if (control !== null && content.contains(control)) {
+        if (control !== openScenarioRunMenu()) {
+          try {
+            control.focus({ preventScroll: true });
+          } catch {
+            control.focus();
+          }
+        }
+        if (
+          typeof focusState.selectionStart === "number"
+          && typeof focusState.selectionEnd === "number"
+          && typeof control.setSelectionRange === "function"
+        ) {
+          control.setSelectionRange(focusState.selectionStart, focusState.selectionEnd);
+        }
+      }
     }
-    const control = focusState.focusKey === undefined
-      ? document.getElementById(focusState.id)
-      : [...content.querySelectorAll("[data-focus-key]")].find((candidate) => {
-        return candidate.getAttribute("data-focus-key") === focusState.focusKey;
-      }) ?? null;
-    if (control === null || !content.contains(control)) {
-      return;
-    }
-    if (control !== openScenarioRunMenu()) {
-      control.focus();
-    }
-    if (
-      typeof focusState.selectionStart === "number"
-      && typeof focusState.selectionEnd === "number"
-      && typeof control.setSelectionRange === "function"
-    ) {
-      control.setSelectionRange(focusState.selectionStart, focusState.selectionEnd);
-    }
+    restorePmuTableScrollState(pmuTableScrollState);
+    restoreDocumentScrollState(documentScrollState);
   }
 
   function scheduleNextRefresh() {
@@ -2363,9 +2580,14 @@ function bootstrap() {
         for (const record of snapshot.scenarioController.prepared) {
           record.confirmExpiresAtMs = receivedAt + record.confirmExpiresInMs;
         }
+        const processChanged = completeSnapshot !== null
+          && completeSnapshot.processIdentity !== snapshot.processIdentity;
+        if (processChanged) {
+          closeScenarioDialog();
+        }
         completeSnapshot = snapshot;
         lastSuccessfulUpdate = new Date(receivedAt);
-        renderCompleteSnapshot();
+        renderCompleteSnapshot(undefined, { preserveOpenMenu: !processChanged });
         updateHeader(snapshot);
         setConnectionPresentation("online", "Online. Coherent console snapshot updated.");
         return snapshot;
