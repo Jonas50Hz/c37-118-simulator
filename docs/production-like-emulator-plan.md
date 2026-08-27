@@ -215,7 +215,7 @@ Likely changes:
 
 Document the startup inputs, catalog schema, management endpoints, metrics,
 time-health semantics, PDC deadlines, restart behavior, baseline command, and
-JSON soak artifact. Preserve the five-PMU V2 onboarding fixture as the Compose
+JSON soak artifact. Preserve the three-PMU V2 C37.118 gateway fixture as the Compose
 default, but make the ten-PMU acceptance profile and catalog invocation
 explicit.
 

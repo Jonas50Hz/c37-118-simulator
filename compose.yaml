@@ -24,7 +24,7 @@ services:
       C37_118_IMAGE_REF: ${C37_118_IMAGE_REF:-local-build}
     volumes:
       - type: bind
-        source: ${C37_118_SIMULATOR_PROFILE_SOURCE:-./profiles/five-pmu-v2.yaml}
+        source: ${C37_118_SIMULATOR_PROFILE_SOURCE:-./profiles/three-pmu-v2.yaml}
         target: /etc/c37-118/profile.yaml
         read_only: true
       - type: bind

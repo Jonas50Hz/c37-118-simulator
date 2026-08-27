@@ -1,0 +1,36 @@
+seed: 20260821
+limits:
+  max_logical_pmus: 100
+  max_clients_per_endpoint: 2
+  max_command_frame_bytes: 4096
+  requested_socket_receive_buffer_bytes: 4096
+  requested_socket_send_buffer_bytes: 4096
+fleet:
+  count: 3
+  bind_address: 0.0.0.0
+  first_listen_port: 4712
+  first_stream_id: 1001
+  first_pmu_id: 1001
+  pdc_name: WAMA
+  pmu_name_prefix: WAMA-PMU-
+  protocol_version: 2
+  v2_good_stat_pmu_ids:
+    - 1001
+    - 1002
+  data_rate_hz: 50
+  time_base: 1000000
+  nominal_frequency_hz: 50
+  phasors:
+    voltage_magnitude: 230000.0
+    voltage_variation: 400.0
+    voltage_class: 400000.0
+    voltage_scale: 10.0
+    current_magnitude: 500.0
+    current_variation: 1.5
+    current_scale: 1.0
+  frequency_deviation_hz:
+    nominal: 0.01
+    variation: 0.002
+  rocof_hz_per_s:
+    nominal: 0.0
+    variation: 0.001

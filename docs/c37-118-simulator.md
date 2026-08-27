@@ -9,7 +9,7 @@
 ## Scope and authority
 
 `c37-118-simulator` is a manually operated C37.118 TCP source simulator. Its
-separate Compose project uses the five-PMU V2 profile for the onboarding
+separate Compose project uses the three-PMU V2 profile for the gateway
 demonstration and attaches to the existing external `wama-infra` network. It is
 not a gateway and has no Kafka, Common Format, Protobuf, Druid, SeaweedFS,
 Forgejo, or data-plane dependency.
@@ -48,9 +48,9 @@ SYNC | FRAMESIZE | IDCODE | SOC | FRACSEC_AND_MSG_TQ | payload | CHK
 the high byte holds message time quality and the low 24 bits hold the
 `TIME_BASE` fraction. The simulator reports conservative unknown message time
 quality and PMU time-quality status by default instead of claiming unavailable
-clock accuracy. The five-PMU V2 onboarding profile is the controlled exception:
+clock accuracy. The three-PMU V2 C37.118 gateway profile is the controlled exception:
 it sets STAT `0` for PMU IDs `1001` and `1002`, allowing their adapters to emit
-`quality.valid=true`; PMU IDs `1003` through `1005` retain the conservative
+`quality.valid=true`; PMU ID `1003` retains the conservative
 status. The V2 message-time-quality byte remains unknown for every endpoint.
 
 | Purpose | SYNC byte | Command code when requested |
@@ -191,7 +191,7 @@ Use `protocol_version: 2` for V2. The supplied profiles are
 `one-hundred-pmu-v2.yaml`, plus `one-hundred-fifty-pmu-v2.yaml`; the existing
 names without `-v2` remain V3.
 
-The default Forgejo onboarding demonstration profile is `five-pmu-v2.yaml`.
+The default Forgejo C37.118 gateway demonstration profile is `five-pmu-v2.yaml`.
 This repository's Compose project assigns the manually started simulator its
 stable `172.30.0.10` address on the external `wama-infra` network; the normal
 infrastructure stack remains the usual creator of that network. For a
@@ -208,8 +208,8 @@ if ! docker network inspect "$network_name" >/dev/null 2>&1; then
 fi
 ```
 
-The profile configures listeners `4712` through `4716`, with matching stream
-and PMU IDs `1001` through `1005`. Its
+The profile configures listeners `4712` through `4714`, with matching stream
+and PMU IDs `1001` through `1003`. Its
 `v2_good_stat_pmu_ids` lists only `1001` and `1002`:
 
 ```sh
@@ -218,7 +218,7 @@ docker compose up -d --force-recreate
 
 docker compose exec c37-118-simulator \
   c37-118-probe --wire-version 2 --host 172.30.0.10 --first-port 4712 \
-  --first-stream-id 1001 --count 5 --duration-seconds 1 --data-rate-hz 50
+  --first-stream-id 1001 --count 3 --duration-seconds 1 --data-rate-hz 50
 ```
 
 The C37.118 listeners are internal to `wama-infra`; the stable address exists
